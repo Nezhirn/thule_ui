@@ -1,5 +1,6 @@
 # Qwen Agent
 
+![Описание картинки](https://lh3.googleusercontent.com/d/1L6Ya-BCRb8AdSndyjB2mLf0GiPzCwwVK)
 **Веб-интерфейс для qwen-cli с поддержкой MCP инструментов**
 
 ---
