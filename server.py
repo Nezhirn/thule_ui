@@ -14,7 +14,7 @@ Qwen Agent — FastAPI + WebSocket + Qwen CLI + MCP
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
-from system_prompt import SYSTEM_PROMPT
+from system_prompt import SYSTEM_PROMPT, get_system_prompt
 
 import asyncio
 import json
@@ -63,8 +63,9 @@ MCP_SERVER_SCRIPT = str(Path(__file__).parent / "mcp_tools_server.py")
 
 
 
-# Хранилище фоновых задач
+# Хранилище фоновых задач: {task_id: {"status": "running", "result": None, "session_id": str}}
 background_tasks: dict = {}
+background_tasks_lock = asyncio.Lock()
 
 # Инструменты требующие подтверждения
 TOOLS_REQUIRING_CONFIRMATION = {
@@ -146,6 +147,14 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN system_prompt TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN provider TEXT DEFAULT 'qwen'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,17 +209,34 @@ def get_sessions(user_id: Optional[str] = None):
     return [dict(r) for r in rows]
 
 
-def create_session(title="Новый чат", user_id: Optional[str] = None):
+def create_session(title="Новый чат", user_id: Optional[str] = None, provider: str = "qwen", model: Optional[str] = None):
     sid = str(uuid.uuid4())
     now = datetime.now().isoformat()
+
+    # Validate provider
+    if provider not in ["qwen", "claude"]:
+        provider = "qwen"
+
+    # Validate model for claude
+    if provider == "claude" and model not in ["opus", "sonnet", "haiku"]:
+        model = "sonnet"  # Default to sonnet
+
     conn = get_db()
     conn.execute(
-        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (sid, user_id, title, now, now),
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sid, user_id, title, now, now, provider, model),
     )
     conn.commit()
     conn.close()
-    return {"id": sid, "title": title, "created_at": now, "updated_at": now, "user_id": user_id}
+    return {
+        "id": sid,
+        "title": title,
+        "created_at": now,
+        "updated_at": now,
+        "user_id": user_id,
+        "provider": provider,
+        "model": model,
+    }
 
 
 def rename_session(sid: str, title: str):
@@ -425,19 +451,109 @@ class MCPSessionManager:
 mcp_manager = MCPSessionManager()
 
 
-async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "") -> str:
+async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws=None) -> str:
+    # Маппинг имён инструментов Claude CLI → MCP
+    TOOL_NAME_MAPPING = {
+        "Write": "write_file",
+        "Bash": "run_bash_command",
+        "Edit": "edit_file",
+        "Read": "read_file",
+        "SSH": "run_ssh_command",
+    }
+
+    # Маппинг параметров Claude CLI → MCP
+    PARAM_MAPPING = {
+        "Write": {"file_path": "path"},
+        "Read": {"file_path": "path"},
+        "Edit": {"file_path": "path"},
+    }
+
+    # Проверяем флаг run_in_background
+    run_in_background = arguments.pop("run_in_background", False)
+
+    # Преобразуем имя инструмента если нужно
+    mcp_tool_name = TOOL_NAME_MAPPING.get(tool_name, tool_name)
+
+    # Преобразуем параметры если нужно
+    if tool_name in PARAM_MAPPING:
+        param_map = PARAM_MAPPING[tool_name]
+        transformed_args = {}
+        for key, value in arguments.items():
+            new_key = param_map.get(key, key)
+            transformed_args[new_key] = value
+        arguments = transformed_args
+
     # Для memory-инструментов передаём session_id как аргумент
-    if tool_name in ("save_memory", "read_memory", "delete_memory") and session_id:
+    if mcp_tool_name in ("save_memory", "read_memory", "delete_memory") and session_id:
         arguments = {**arguments, "session_id": session_id}
 
-    # Таймаут 180 секунд для MCP инструментов (bash команды имеют свой таймаут 120 сек)
+    # Если фоновое выполнение - запускаем асинхронно
+    if run_in_background and mcp_tool_name in ("run_bash_command", "run_ssh_command"):
+        task_id = str(uuid.uuid4())[:8]
+
+        async def background_runner():
+            try:
+                result = await mcp_manager.call_tool(mcp_tool_name, arguments, timeout=180.0)
+                result_text = getattr(result, "content", [{"text": str(result)}])[0].text if getattr(result, "content", None) else "(пустой результат)"
+
+                async with background_tasks_lock:
+                    background_tasks[task_id] = {
+                        "status": "completed",
+                        "result": result_text,
+                        "session_id": session_id
+                    }
+
+                # Отправляем уведомление через WebSocket если доступен
+                if ws:
+                    try:
+                        await ws.send_json({
+                            "type": "background_task_completed",
+                            "task_id": task_id,
+                            "result": result_text[:1000]
+                        })
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                error_msg = f"Error: {str(e)}"
+                async with background_tasks_lock:
+                    background_tasks[task_id] = {
+                        "status": "failed",
+                        "result": error_msg,
+                        "session_id": session_id
+                    }
+
+                if ws:
+                    try:
+                        await ws.send_json({
+                            "type": "background_task_failed",
+                            "task_id": task_id,
+                            "error": error_msg
+                        })
+                    except Exception:
+                        pass
+
+        # Сохраняем задачу как running
+        async with background_tasks_lock:
+            background_tasks[task_id] = {
+                "status": "running",
+                "result": None,
+                "session_id": session_id
+            }
+
+        # Запускаем в фоне
+        asyncio.create_task(background_runner())
+
+        return f"Команда запущена в фоне (task_id: {task_id}). Вы получите уведомление по завершении."
+
+    # Обычное синхронное выполнение
     try:
-        result = await mcp_manager.call_tool(tool_name, arguments, timeout=180.0)
+        result = await mcp_manager.call_tool(mcp_tool_name, arguments, timeout=180.0)
         return getattr(result, "content", [{"text": str(result)}])[0].text if getattr(result, "content", None) else "(пустой результат)"
     except TimeoutError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        logger.error(f"MCP tool {tool_name} error: {e}", exc_info=True)
+        logger.error(f"MCP tool {mcp_tool_name} error: {e}", exc_info=True)
         return f"Error: {str(e)}"
 
 
@@ -452,27 +568,98 @@ async def get_mcp_tools() -> list:
     return _tools_cache
 
 
-# ─── Qwen CLI SDK mode ──────────────────────────────────────────
+# ─── CLI Provider Abstraction ───────────────────────────────────
 
-def run_qwen_cli_sdk(session_id: str = None, resume_id: str = None):
+class CLIProvider:
+    """Base class for AI CLI providers."""
+
+    def get_command(self, session_id: str = None, resume_id: str = None) -> list:
+        """Returns command array for subprocess.Popen."""
+        raise NotImplementedError
+
+    def get_cli_path(self) -> str:
+        """Returns path to CLI executable."""
+        raise NotImplementedError
+
+    def validate_model(self, model: Optional[str]) -> bool:
+        """Validates model name for this provider."""
+        raise NotImplementedError
+
+    def get_provider_name(self) -> str:
+        """Returns provider name for logging."""
+        raise NotImplementedError
+
+
+class QwenCLIProvider(CLIProvider):
+    def get_cli_path(self) -> str:
+        return os.getenv("QWEN_PATH", "/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen")
+
+    def get_command(self, session_id: str = None, resume_id: str = None) -> list:
+        cmd = [
+            self.get_cli_path(),
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--approval-mode", "default",
+        ]
+        if resume_id:
+            cmd.extend(["--resume", resume_id])
+        elif session_id:
+            cmd.extend(["--session-id", session_id])
+        return cmd
+
+    def validate_model(self, model: Optional[str]) -> bool:
+        return True  # Qwen doesn't use model parameter
+
+    def get_provider_name(self) -> str:
+        return "qwen"
+
+
+class ClaudeCLIProvider(CLIProvider):
+    def __init__(self, model: str = "sonnet"):
+        self.model = model
+
+    def get_cli_path(self) -> str:
+        return os.getenv("CLAUDE_PATH", "/home/andrew/.npm-global/bin/claude")
+
+    def get_command(self, session_id: str = None, resume_id: str = None) -> list:
+        cmd = [
+            self.get_cli_path(),
+            "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", "bypassPermissions",
+            "--strict-mcp-config",  # Игнорировать глобальную MCP конфигурацию
+            "--model", self.model,
+        ]
+        if resume_id:
+            cmd.extend(["--resume", resume_id])
+        elif session_id:
+            cmd.extend(["--session-id", session_id])
+        return cmd
+
+    def validate_model(self, model: Optional[str]) -> bool:
+        return model in ["opus", "sonnet", "haiku"]
+
+    def get_provider_name(self) -> str:
+        return f"claude-{self.model}"
+
+
+# ─── CLI SDK mode ───────────────────────────────────────────────
+
+def run_cli_sdk(provider: CLIProvider, session_id: str = None, resume_id: str = None):
     """
-    Запускает qwen cli в SDK mode.
-    --session-id для первого сообщения (создаёт сессию).
-    --resume <uuid> для последующих (загружает историю).
+    Spawns AI CLI in SDK mode using the provided provider.
+    Supports both qwen and claude with identical protocol.
     """
-    qwen_path = os.getenv("QWEN_PATH", "/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen")
-    cmd = [
-        qwen_path,
-        "--input-format", "stream-json",
-        "--output-format", "stream-json",
-        "--approval-mode", "default",
-    ]
-    if resume_id:
-        # --resume <uuid> загружает существующую сессию
-        cmd.extend(["--resume", resume_id])
-    elif session_id:
-        # --session-id <uuid> создаёт новую сессию с данным ID
-        cmd.extend(["--session-id", session_id])
+    cmd = provider.get_command(session_id=session_id, resume_id=resume_id)
+    logger.info(f"Starting CLI: {' '.join(cmd)}")
+
+    # Prepare environment - remove CLAUDECODE to allow nested Claude sessions
+    env = os.environ.copy()
+    if 'CLAUDECODE' in env:
+        del env['CLAUDECODE']
+        logger.info("Removed CLAUDECODE env var to allow nested Claude CLI")
 
     return subprocess.Popen(
         cmd,
@@ -482,7 +669,17 @@ def run_qwen_cli_sdk(session_id: str = None, resume_id: str = None):
         text=True,
         bufsize=1,
         preexec_fn=os.setsid,
+        env=env,
     )
+
+
+def run_qwen_cli_sdk(session_id: str = None, resume_id: str = None):
+    """
+    Legacy wrapper for backward compatibility.
+    Запускает qwen cli в SDK mode.
+    """
+    provider = QwenCLIProvider()
+    return run_cli_sdk(provider, session_id=session_id, resume_id=resume_id)
 
 
 # ─── Утилиты ────────────────────────────────────────────────────
@@ -558,10 +755,8 @@ async def _wait_for_confirmation(
         # None означает что соединение закрыто
         if data is None:
             return "stop"
-        if isinstance(data, str):
-            return data
-        if isinstance(data, dict):
-            return data.get("action", "deny")
+        # Возвращаем данные как есть - для question это dict, для confirm это строка или dict с action
+        return data
 
     # Таймаут - возвращаем stop чтобы не ждать вечно
     return "stop"
@@ -588,8 +783,8 @@ async def _wait_for_init_response(proc, timeout=30):
     return None
 
 
-def build_history(messages: list, session_id: str = "", custom_prompt: str = None) -> list:
-    effective_prompt = custom_prompt or SYSTEM_PROMPT
+def build_history(messages: list, session_id: str = "", custom_prompt: str = None, provider: str = "qwen") -> list:
+    effective_prompt = custom_prompt or get_system_prompt(provider)
     system_msg = {"role": "system", "content": effective_prompt}
 
     all_msgs = []
@@ -693,9 +888,22 @@ async def stream_chat_background(
     await _safe_send(ws, {"type": "response_start"})
     await _safe_send(ws, {"type": "stream_start"})
 
+    # Load provider and model from session FIRST
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT provider, model FROM sessions WHERE id = ?",
+        (session_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    provider_name = row[0] if row and row[0] else 'qwen'
+    model = row[1] if row and row[1] else None
+
     db_messages = get_messages(session_id)
     custom_prompt = get_session_prompt(session_id)
-    history = build_history(db_messages, session_id=session_id, custom_prompt=custom_prompt)
+    history = build_history(db_messages, session_id=session_id, custom_prompt=custom_prompt, provider=provider_name)
 
     thinking_buffer = ""
     content_buffer = ""
@@ -710,29 +918,40 @@ async def stream_chat_background(
 
     proc = None
     try:
+
+        # Create provider instance
+        if provider_name == 'claude':
+            if not model:
+                model = 'sonnet'  # Default to sonnet
+            provider = ClaudeCLIProvider(model=model)
+            logger.info(f"Using Claude CLI with model: {model}")
+        else:
+            provider = QwenCLIProvider()
+            logger.info(f"Using Qwen CLI")
+
         # Если в БД есть предыдущие сообщения (не только текущее) — resume
         has_history = len(db_messages) > 1
 
         # Проверяем что session_id — полный UUID (36 символов)
         is_valid_uuid = len(session_id) == 36 and session_id.count('-') == 4
 
-        # Если есть кастомный промпт — НЕ используем qwen session management
+        # Если есть кастомный промпт — НЕ используем session management
         use_full_history = custom_prompt is not None
 
         # SDK mode: инициализация и отправка через stdin
         if use_full_history:
             # Кастомный промпт: запускаем БЕЗ --session-id/--resume
             # Управляем историей сами через SQLite
-            proc = run_qwen_cli_sdk()
+            proc = run_cli_sdk(provider)
         elif has_history and is_valid_uuid:
             # Нет кастомного промпта + есть история: используем --resume
-            proc = run_qwen_cli_sdk(resume_id=session_id)
+            proc = run_cli_sdk(provider, resume_id=session_id)
         elif is_valid_uuid:
             # Нет кастомного промпта + первое сообщение: создаём сессию
-            proc = run_qwen_cli_sdk(session_id=session_id)
+            proc = run_cli_sdk(provider, session_id=session_id)
         else:
-            # Старая сессия с коротким ID — без контекста qwen
-            proc = run_qwen_cli_sdk()
+            # Старая сессия с коротким ID — без контекста
+            proc = run_cli_sdk(provider)
 
         # 1. Инициализируем SDK mode
         init_request = {"subtype": "initialize"}
@@ -754,8 +973,8 @@ async def stream_chat_background(
 
         # Fallback: если процесс умер (например --resume на несуществующей сессии)
         if init_resp is None and proc.poll() is not None:
-            logger.warning(f"qwen процесс завершился, пробуем без --resume (session_id={session_id})")
-            proc = run_qwen_cli_sdk()
+            logger.warning(f"{provider.get_provider_name()} процесс завершился, пробуем без --resume (session_id={session_id})")
+            proc = run_cli_sdk(provider)
             init_msg_fallback = json.dumps({
                 "type": "control_request",
                 "request_id": "init-002",
@@ -769,7 +988,7 @@ async def stream_chat_background(
         # 2. Отправляем полную историю если нужно (кастомный промпт или fallback)
         if use_full_history:
             # Если system_prompt не был принят в init, отправляем как первое сообщение
-            effective_prompt = custom_prompt if custom_prompt else SYSTEM_PROMPT
+            effective_prompt = custom_prompt if custom_prompt else get_system_prompt(provider_name)
 
             # Пробуем отправить как user message с system content
             system_as_user = json.dumps({
@@ -968,6 +1187,8 @@ async def stream_chat_background(
                 pending_tool_calls, connection_state, confirm_queue,
                 stop_event, session_id, tool_results_log, last_tool_call_time, BASH_TOOLS
             )
+            if done:
+                break
     except asyncio.CancelledError:
         # Задача отменена - корректно завершаем процесс и отправляем сигнал
         logger.info(f"Задача отменена для сессии {session_id}")
@@ -1052,9 +1273,46 @@ async def _process_line(
         rid = data.get("request_id", "")
         sub = req.get("subtype", "")
 
+        logger.info(f"control_request: subtype={sub}, request_id={rid}")
+
         if sub == "can_use_tool":
             tool_name = req.get("tool_name", "")
             tool_input = req.get("input", {})
+
+            logger.info(f"can_use_tool: tool_name={tool_name}")
+
+            # Специальная обработка ask_user_question (Qwen и Claude)
+            if tool_name in ("ask_user_question", "AskUserQuestion"):
+                questions = tool_input.get("questions", [])
+
+                # Форматируем вопросы в красивый текст
+                formatted_text = ""
+                for i, q in enumerate(questions, 1):
+                    if i > 1:
+                        formatted_text += "\n"
+
+                    header = q.get("header", f"Question {i}")
+                    question = q.get("question", "")
+                    options = q.get("options", [])
+
+                    formatted_text += f"**{header}**: {question}\n"
+
+                    for j, opt in enumerate(options, 1):
+                        label = opt.get("label", "")
+                        description = opt.get("description", "")
+                        formatted_text += f"{j}. **{label}** — {description}\n"
+
+                # Отправляем вопросы как обычный content
+                await _safe_send(ws, {
+                    "type": "content",
+                    "content": formatted_text
+                })
+
+                # Убиваем процесс qwen
+                _kill_proc(proc)
+
+                # Возвращаем formatted_text в content_buffer и done=True
+                return thinking_buffer, content_buffer + formatted_text, True, last_tool_call_time
 
             # Авто-одобрение если allow_all
             if connection_state.get("allow_all"):
@@ -1082,6 +1340,10 @@ async def _process_line(
 
             # Ждём ответа от пользователя
             action = await _wait_for_confirmation(confirm_queue, stop_event)
+
+            # Обрабатываем ответ (может быть строка или dict с action)
+            if isinstance(action, dict):
+                action = action.get("action", "deny")
 
             if action == "stop":
                 stop_event.set()
@@ -1178,6 +1440,39 @@ async def _process_line(
                 tool_args = item.get("input", {})
                 tool_id = item.get("id", "")
 
+                # Специальная обработка ask_user_question (Qwen и Claude)
+                if tool_name in ("ask_user_question", "AskUserQuestion"):
+                    questions = tool_args.get("questions", [])
+
+                    # Форматируем вопросы в красивый текст
+                    formatted_text = ""
+                    for i, q in enumerate(questions, 1):
+                        if i > 1:
+                            formatted_text += "\n"
+
+                        header = q.get("header", f"Question {i}")
+                        question = q.get("question", "")
+                        options = q.get("options", [])
+
+                        formatted_text += f"**{header}**: {question}\n"
+
+                        for j, opt in enumerate(options, 1):
+                            label = opt.get("label", "")
+                            description = opt.get("description", "")
+                            formatted_text += f"{j}. **{label}** — {description}\n"
+
+                    # Отправляем вопросы как обычный content
+                    await _safe_send(ws, {
+                        "type": "content",
+                        "content": formatted_text
+                    })
+
+                    # Убиваем процесс CLI
+                    _kill_proc(proc)
+
+                    # Возвращаем formatted_text в content_buffer и done=True
+                    return thinking_buffer, content_buffer + formatted_text, True, last_tool_call_time
+
                 # Запоминаем время вызова ТОЛЬКО для bash команд
                 if tool_name in BASH_TOOLS:
                     last_tool_call_time = asyncio.get_event_loop().time()
@@ -1197,6 +1492,163 @@ async def _process_line(
                     "args": tool_args
                 })
 
+                # Проверяем нужно ли подтверждение (для Claude CLI)
+                if tool_name in TOOLS_REQUIRING_CONFIRMATION:
+                    # Авто-одобрение если allow_all
+                    if connection_state.get("allow_all"):
+                        # Выполняем инструмент через MCP
+                        try:
+                            result = await run_mcp_tool(tool_name, tool_args, session_id, ws)
+                        except Exception as e:
+                            result = f"Error: {str(e)}"
+
+                        # Отправляем результат обратно в Claude CLI
+                        tool_result_msg = json.dumps({
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result
+                                }]
+                            }
+                        })
+                        try:
+                            proc.stdin.write(tool_result_msg + "\n")
+                            proc.stdin.flush()
+                        except Exception:
+                            pass
+
+                        # Отправляем результат во фронт
+                        await _safe_send(ws, {
+                            "type": "tool_result",
+                            "name": tool_name,
+                            "content": result[:3000]
+                        })
+
+                        # Копим в лог
+                        tool_results_log.append({"content": result, "tool_name": tool_name})
+
+                        # Удаляем из pending
+                        if tool_id in pending_tool_calls:
+                            del pending_tool_calls[tool_id]
+
+                        # Сбрасываем таймер
+                        last_tool_call_time = None
+                    else:
+                        # Показываем confirm UI во фронте
+                        await _safe_send(ws, {
+                            "type": "confirm_request",
+                            "name": tool_name,
+                            "args": tool_args
+                        })
+
+                        # Ждём ответа от пользователя
+                        action = await _wait_for_confirmation(confirm_queue, stop_event)
+
+                        # Обрабатываем ответ
+                        if isinstance(action, dict):
+                            action = action.get("action", "deny")
+
+                        if action == "stop":
+                            stop_event.set()
+                            # Отправляем error result в Claude
+                            error_msg = json.dumps({
+                                "type": "user",
+                                "message": {
+                                    "role": "user",
+                                    "content": [{
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_id,
+                                        "content": "Остановлено пользователем",
+                                        "is_error": True
+                                    }]
+                                }
+                            })
+                            try:
+                                proc.stdin.write(error_msg + "\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+
+                            if tool_id in pending_tool_calls:
+                                del pending_tool_calls[tool_id]
+                            last_tool_call_time = None
+
+                        elif action == "deny":
+                            # Отправляем error result в Claude
+                            error_msg = json.dumps({
+                                "type": "user",
+                                "message": {
+                                    "role": "user",
+                                    "content": [{
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_id,
+                                        "content": "Отклонено пользователем",
+                                        "is_error": True
+                                    }]
+                                }
+                            })
+                            try:
+                                proc.stdin.write(error_msg + "\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+
+                            await _safe_send(ws, {"type": "tool_denied", "name": tool_name})
+
+                            if tool_id in pending_tool_calls:
+                                del pending_tool_calls[tool_id]
+                            last_tool_call_time = None
+
+                        else:
+                            # allow или allow_all
+                            if action == "allow_all":
+                                connection_state["allow_all"] = True
+                                await _safe_send(ws, {"type": "allow_all_enabled"})
+
+                            # Выполняем инструмент через MCP
+                            try:
+                                result = await run_mcp_tool(tool_name, tool_args, session_id, ws)
+                            except Exception as e:
+                                result = f"Error: {str(e)}"
+
+                            # Отправляем результат обратно в Claude CLI
+                            tool_result_msg = json.dumps({
+                                "type": "user",
+                                "message": {
+                                    "role": "user",
+                                    "content": [{
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_id,
+                                        "content": result
+                                    }]
+                                }
+                            })
+                            try:
+                                proc.stdin.write(tool_result_msg + "\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+
+                            # Отправляем результат во фронт
+                            await _safe_send(ws, {
+                                "type": "tool_result",
+                                "name": tool_name,
+                                "content": result[:3000]
+                            })
+
+                            # Копим в лог
+                            tool_results_log.append({"content": result, "tool_name": tool_name})
+
+                            # Удаляем из pending
+                            if tool_id in pending_tool_calls:
+                                del pending_tool_calls[tool_id]
+
+                            # Сбрасываем таймер
+                            last_tool_call_time = None
+
         return thinking_buffer, content_buffer, False, last_tool_call_time
 
     # --- user (tool_result): qwen исполнил инструмент ---
@@ -1205,7 +1657,7 @@ async def _process_line(
         for item in content_list:
             if item.get("type") == "tool_result":
                 tool_use_id = item.get("tool_use_id", "")
-                
+
                 # Нормализуем content (может быть list или str)
                 raw_content = item.get("content", "")
                 if isinstance(raw_content, list):
@@ -1222,22 +1674,24 @@ async def _process_line(
                     tool_content = str(raw_content)
 
                 # Матчим по tool_use_id → tool_name
-                result_name = ""
+                # Если tool_use_id НЕ в pending_tool_calls, значит мы уже обработали этот инструмент
+                # через MCP и отправили результат во фронт. Пропускаем дубликат.
                 if tool_use_id in pending_tool_calls:
                     result_name = pending_tool_calls[tool_use_id]["name"]
                     del pending_tool_calls[tool_use_id]
 
-                await _safe_send(ws, {
-                    "type": "tool_result",
-                    "name": result_name or tool_use_id,
-                    "content": tool_content[:3000]
-                })
+                    await _safe_send(ws, {
+                        "type": "tool_result",
+                        "name": result_name or tool_use_id,
+                        "content": tool_content[:3000]
+                    })
 
-                # Копим в лог (сохраним позже в правильном порядке)
-                tool_results_log.append({"content": tool_content, "tool_name": result_name})
+                    # Копим в лог (сохраним позже в правильном порядке)
+                    tool_results_log.append({"content": tool_content, "tool_name": result_name})
 
-                # Сбрасываем таймер после получения результата
-                last_tool_call_time = None
+                    # Сбрасываем таймер после получения результата
+                    last_tool_call_time = None
+                # else: это эхо от Claude CLI, пропускаем
 
         return thinking_buffer, content_buffer, False, last_tool_call_time
 
@@ -1321,7 +1775,9 @@ async def api_create_session(request: Request):
     except Exception:
         body = {}
     title = body.get("title", "Новый чат")
-    return create_session(title)
+    provider = body.get("provider", "qwen")
+    model = body.get("model")
+    return create_session(title, provider=provider, model=model)
 
 
 @app.delete("/api/sessions/{sid}")
@@ -1379,6 +1835,27 @@ async def api_set_system_prompt(sid: str, request: Request):
     prompt = body.get("system_prompt")
     set_session_prompt(sid, prompt)
     return {"ok": True, "system_prompt": prompt}
+
+
+@app.patch("/api/sessions/{sid}/settings")
+async def api_update_session_settings(sid: str, request: Request):
+    """Update session provider and model settings."""
+    body = await request.json()
+    provider = body.get("provider")
+    model = body.get("model")
+
+    if provider not in ["qwen", "claude"]:
+        raise HTTPException(400, "Invalid provider")
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE sessions SET provider = ?, model = ?, updated_at = ? WHERE id = ?",
+        (provider, model, datetime.now().isoformat(), sid)
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "provider": provider, "model": model}
 
 
 @app.get("/api/sessions/{sid}/task-status")

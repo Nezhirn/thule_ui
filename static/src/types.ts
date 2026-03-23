@@ -5,6 +5,8 @@ export interface Session {
   updated_at: string;
   user_id?: string;
   system_prompt?: string;
+  provider?: 'qwen' | 'claude';
+  model?: string;
 }
 
 export interface Message {

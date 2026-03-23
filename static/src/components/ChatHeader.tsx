@@ -7,6 +7,10 @@ interface Props {
   onToggleSidebar: () => void;
   onOpenSettings: () => void;
   onExport: () => void;
+  provider?: 'qwen' | 'claude';
+  model?: string;
+  onProviderChange?: (provider: 'qwen' | 'claude') => void;
+  onModelChange?: (model: string) => void;
 }
 
 export default function ChatHeader({
@@ -14,6 +18,10 @@ export default function ChatHeader({
   onToggleSidebar,
   onOpenSettings,
   onExport,
+  provider = 'qwen',
+  model = 'sonnet',
+  onProviderChange,
+  onModelChange,
 }: Props) {
   return (
     <header className="h-14 flex-shrink-0 glass border-b border-border/50 flex items-center justify-between px-4 z-10 relative">
@@ -49,6 +57,29 @@ export default function ChatHeader({
 
       {session && (
         <div className="flex items-center gap-2">
+          {/* Provider selector */}
+          <select
+            value={provider}
+            onChange={(e) => onProviderChange?.(e.target.value as 'qwen' | 'claude')}
+            className="px-2 py-1 text-xs rounded-lg bg-bg-primary/80 border border-border/60 text-text-primary outline-none focus:border-accent/40 transition-all duration-200"
+          >
+            <option value="qwen">Qwen</option>
+            <option value="claude">Claude</option>
+          </select>
+
+          {/* Model selector (only for Claude) */}
+          {provider === 'claude' && (
+            <select
+              value={model}
+              onChange={(e) => onModelChange?.(e.target.value)}
+              className="px-2 py-1 text-xs rounded-lg bg-bg-primary/80 border border-border/60 text-text-primary outline-none focus:border-accent/40 transition-all duration-200"
+            >
+              <option value="opus">Opus</option>
+              <option value="sonnet">Sonnet</option>
+              <option value="haiku">Haiku</option>
+            </select>
+          )}
+
           <motion.button
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}

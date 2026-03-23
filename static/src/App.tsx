@@ -23,6 +23,8 @@ export function App() {
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [wsStatus, setWsStatus] = useState<'connected' | 'connecting' | 'reconnecting' | 'disconnected'>('connecting');
   const [allowAll, setAllowAll] = useState(false);
+  const [provider, setProvider] = useState<'qwen' | 'claude'>('qwen');
+  const [model, setModel] = useState<string>('sonnet');
 
   const [streaming, setStreaming] = useState<StreamingMessage>({
     thinking: '',
@@ -246,6 +248,7 @@ export function App() {
         setPhase('idle');
         setPhaseStart(null);
         setConfirmRequest(null);
+        setQuestionRequest(null);
         if (currentSessionRef.current) {
           api.fetchMessages(currentSessionRef.current.id).then((msgs) => {
             setMessages(msgs);
@@ -262,6 +265,7 @@ export function App() {
         setPhase('idle');
         setPhaseStart(null);
         setConfirmRequest(null);
+        setQuestionRequest(null);
         setStreaming({ thinking: '', content: '', tools: [] });
         break;
 
@@ -274,6 +278,22 @@ export function App() {
       }
 
       case 'ping':
+        break;
+
+      case 'background_task_completed':
+        // Показываем уведомление о завершении фоновой задачи
+        setStreaming((prev) => ({
+          ...prev,
+          content: prev.content + `\n\n✅ Фоновая задача завершена (${data.task_id}):\n${data.result}\n`,
+        }));
+        break;
+
+      case 'background_task_failed':
+        // Показываем уведомление об ошибке фоновой задачи
+        setStreaming((prev) => ({
+          ...prev,
+          content: prev.content + `\n\n❌ Фоновая задача завершилась с ошибкой (${data.task_id}):\n${data.error}\n`,
+        }));
         break;
     }
   }, []);
@@ -292,6 +312,8 @@ export function App() {
       setIsBusy(false);
       setPhase('idle');
       setConfirmRequest(null);
+      setProvider(session.provider || 'qwen');
+      setModel(session.model || 'sonnet');
 
       try {
         const msgs = await api.fetchMessages(id);
@@ -307,7 +329,7 @@ export function App() {
 
   const handleCreateSession = useCallback(async () => {
     try {
-      const session = await api.createSession();
+      const session = await api.createSession('Новый чат', provider, model);
       setSessions((prev) => [session, ...prev]);
       setCurrentSession(session);
       setMessages([]);
@@ -319,7 +341,7 @@ export function App() {
     } catch (e) {
       console.error('Failed to create session:', e);
     }
-  }, [connectWs]);
+  }, [connectWs, provider, model]);
 
   const handleDeleteSession = useCallback(
     async (id: string) => {
@@ -382,6 +404,42 @@ export function App() {
     setCurrentSession((prev) => (prev?.id === id ? { ...prev, title } : prev));
   }, []);
 
+  const handleProviderChange = useCallback(async (newProvider: 'qwen' | 'claude') => {
+    if (!currentSession) return;
+    setProvider(newProvider);
+    try {
+      await api.saveSessionSettings(currentSession.id, {
+        provider: newProvider,
+        model: newProvider === 'claude' ? model : null,
+      });
+      // Update local session state
+      setSessions((prev) => prev.map((s) =>
+        s.id === currentSession.id ? { ...s, provider: newProvider, model: newProvider === 'claude' ? model : null } : s
+      ));
+      setCurrentSession((prev) => prev ? { ...prev, provider: newProvider, model: newProvider === 'claude' ? model : null } : null);
+    } catch (e) {
+      console.error('Failed to update provider:', e);
+    }
+  }, [currentSession, model]);
+
+  const handleModelChange = useCallback(async (newModel: string) => {
+    if (!currentSession) return;
+    setModel(newModel);
+    try {
+      await api.saveSessionSettings(currentSession.id, {
+        provider,
+        model: newModel,
+      });
+      // Update local session state
+      setSessions((prev) => prev.map((s) =>
+        s.id === currentSession.id ? { ...s, model: newModel } : s
+      ));
+      setCurrentSession((prev) => prev ? { ...prev, model: newModel } : null);
+    } catch (e) {
+      console.error('Failed to update model:', e);
+    }
+  }, [currentSession, provider]);
+
   const renderedMessages = renderMessageList(messages);
 
   useEffect(() => {
@@ -416,6 +474,10 @@ export function App() {
           onToggleSidebar={() => setSidebarOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onExport={() => currentSession && api.exportSession(currentSession.id)}
+          provider={provider}
+          model={model}
+          onProviderChange={handleProviderChange}
+          onModelChange={handleModelChange}
         />
 
         <AnimatePresence mode="wait">

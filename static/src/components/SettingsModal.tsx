@@ -7,6 +7,7 @@ import {
   saveSessionPrompt,
   renameSession as apiRename,
   fetchDefaultPrompt,
+  saveSessionSettings,
 } from '../api';
 
 interface Props {
@@ -25,11 +26,15 @@ export default function SettingsModal({
   const [title, setTitle] = useState('');
   const [prompt, setPrompt] = useState('');
   const [defaultPrompt, setDefaultPrompt] = useState('');
+  const [provider, setProvider] = useState<'qwen' | 'claude'>('qwen');
+  const [model, setModel] = useState<string>('sonnet');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (isOpen && session) {
       setTitle(session.title);
+      setProvider(session.provider || 'qwen');
+      setModel(session.model || 'sonnet');
       fetchSessionPrompt(session.id).then(setPrompt);
       fetchDefaultPrompt().then(setDefaultPrompt);
     }
@@ -57,6 +62,13 @@ export default function SettingsModal({
         onRenamed(session.id, title);
       }
       await saveSessionPrompt(session.id, prompt || null);
+
+      // Save provider and model
+      await saveSessionSettings(session.id, {
+        provider,
+        model: provider === 'claude' ? model : null,
+      });
+
       onClose();
     } catch (e) {
       console.error('Save error:', e);
@@ -138,6 +150,37 @@ export default function SettingsModal({
                   Оставьте пустым для промпта по умолчанию
                 </p>
               </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-text-secondary mb-2 uppercase tracking-wider">
+                  Провайдер
+                </label>
+                <select
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value as 'qwen' | 'claude')}
+                  className="w-full py-2.5 px-4 text-sm rounded-xl bg-bg-primary/80 border border-border/60 text-text-primary outline-none focus:border-accent/40 focus:ring-2 focus:ring-accent/10 transition-all duration-200"
+                >
+                  <option value="qwen">Qwen</option>
+                  <option value="claude">Claude</option>
+                </select>
+              </div>
+
+              {provider === 'claude' && (
+                <div>
+                  <label className="block text-xs font-semibold text-text-secondary mb-2 uppercase tracking-wider">
+                    Модель Claude
+                  </label>
+                  <select
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    className="w-full py-2.5 px-4 text-sm rounded-xl bg-bg-primary/80 border border-border/60 text-text-primary outline-none focus:border-accent/40 focus:ring-2 focus:ring-accent/10 transition-all duration-200"
+                  >
+                    <option value="opus">Opus (наиболее способная)</option>
+                    <option value="sonnet">Sonnet (сбалансированная)</option>
+                    <option value="haiku">Haiku (быстрая)</option>
+                  </select>
+                </div>
+              )}
 
               <div className="flex items-start gap-2.5 p-3.5 rounded-xl bg-accent/[0.05] border border-accent/10">
                 <Info size={14} className="text-accent/60 flex-shrink-0 mt-0.5" />
