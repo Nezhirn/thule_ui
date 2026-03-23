@@ -43,9 +43,6 @@ from mcp.client.stdio import stdio_client
 
 # ─── Конфигурация ───────────────────────────────────────────────
 
-import logging
-import sys
-
 # Настройка логирования ДО всех импортов которые используют logger
 log_handler = logging.FileHandler(Path(__file__).parent / "server.log")
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -69,11 +66,17 @@ background_tasks_lock = asyncio.Lock()
 
 # Инструменты требующие подтверждения
 TOOLS_REQUIRING_CONFIRMATION = {
+    # Bash/Shell инструменты
     "Bash", "bash", "run_bash_command", "execute_command",
     "run_command", "shell", "run_shell_command",
+    # SSH инструменты
     "ssh", "SSH", "run_ssh_command", "remote_command",
-    "Write", "write_file", "create_file",
-    "Edit", "edit_file", "replace_in_file",
+    # Файловые инструменты (опасные)
+    "Write", "write_file", "create_file", "WriteFile",
+    "Edit", "edit_file", "replace_in_file", "EditFile",
+    "delete_file", "remove_file", "rm_file",
+    # Операционные системы
+    "system_reboot", "system_shutdown", "reboot", "shutdown",
 }
 
 # Лимиты безопасности
@@ -355,10 +358,10 @@ class MCPSessionManager:
         """Создаёт новую MCP-сессию. Вызывать ТОЛЬКО под self._lock."""
         await self._close_internal()
 
-        env = {**os.environ}
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         params = StdioServerParameters(
             command=MCP_PYTHON,
-            args=[MCP_SERVER_SCRIPT],
+            args=["-u", MCP_SERVER_SCRIPT],  # -u для unbuffered stdout
             cwd=str(Path(__file__).parent),
             env=env,
         )
@@ -404,12 +407,15 @@ class MCPSessionManager:
     async def call_tool(self, name: str, arguments: dict, timeout: float = 180.0):
         async with self._lock:
             try:
+                logger.info(f"[MCP] Calling tool: {name} with args: {arguments}")
                 session = await self._ensure_session()
+                logger.info(f"[MCP] Session ready, calling tool...")
                 # Добавляем таймаут на вызов MCP инструмента
                 result = await asyncio.wait_for(
                     session.call_tool(name, arguments=arguments),
                     timeout=timeout
                 )
+                logger.info(f"[MCP] Tool {name} returned: {result}")
                 return result
             except asyncio.TimeoutError:
                 # Таймаут MCP вызова - пересоздаём сессию
@@ -420,7 +426,8 @@ class MCPSessionManager:
             except asyncio.CancelledError:
                 # CancelledError — НЕ маркируем сессию как сломанную
                 raise
-            except Exception:
+            except Exception as e:
+                logger.error(f"MCP tool {name} error: {e}", exc_info=True)
                 # Реальная ошибка MCP — пересоздадим сессию при следующем вызове
                 self._connected = False
                 self._session = None
@@ -451,15 +458,45 @@ class MCPSessionManager:
 mcp_manager = MCPSessionManager()
 
 
-async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws=None) -> str:
-    # Маппинг имён инструментов Claude CLI → MCP
+async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws=None, original_tool_id: str = None) -> str:
+    # Маппинг имён инструментов Claude/Qwen CLI → MCP
+    # Расширенный маппинг для всех поддерживаемых инструментов
     TOOL_NAME_MAPPING = {
+        # Claude CLI инструменты
         "Write": "write_file",
         "Bash": "run_bash_command",
         "Edit": "edit_file",
         "Read": "read_file",
         "SSH": "run_ssh_command",
+        "Agent": "__unsupported__",
+        "Task": "__unsupported__",
+        "Subagent": "__unsupported__",
+        "subagent": "__unsupported__",
+        # Qwen CLI инструменты
+        "run_shell_command": "run_bash_command",
+        "execute_command": "run_bash_command",
+        "run_command": "run_bash_command",
+        "shell": "run_bash_command",
+        # Memory инструменты
+        "save_memory": "save_memory",
+        "read_memory": "read_memory",
+        "delete_memory": "delete_memory",
+        # Todo инструменты
+        "todo_write": "todo_write",
+        "todo_read": "todo_read",
+        # Файловые инструменты
+        "list_directory": "list_directory",
+        "glob": "glob",
+        "grep_search": "grep_search",
+        # Веб инструменты
+        "web_fetch": "web_fetch",
+        "fetch_webpage": "web_fetch",
+        "web_search": "web_search",
+        "search_web": "web_search",
     }
+
+    # Инструменты которые не поддерживаются через MCP
+    UNSUPPORTED_TOOLS = {"__unsupported__"}
 
     # Маппинг параметров Claude CLI → MCP
     PARAM_MAPPING = {
@@ -468,11 +505,15 @@ async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws
         "Edit": {"file_path": "path"},
     }
 
-    # Проверяем флаг run_in_background
-    run_in_background = arguments.pop("run_in_background", False)
+    # Проверяем флаг run_in_background и сохраняем его
+    run_in_background = arguments.pop("run_in_background", False) if isinstance(arguments, dict) else False
 
     # Преобразуем имя инструмента если нужно
     mcp_tool_name = TOOL_NAME_MAPPING.get(tool_name, tool_name)
+
+    # Проверяем поддерживается ли инструмент
+    if mcp_tool_name in UNSUPPORTED_TOOLS:
+        return f"[ОШИБКА] Инструмент '{tool_name}' не поддерживается в веб-интерфейсе. Суб-агенты и Task-система требуют прямого доступа к CLI."
 
     # Преобразуем параметры если нужно
     if tool_name in PARAM_MAPPING:
@@ -483,8 +524,8 @@ async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws
             transformed_args[new_key] = value
         arguments = transformed_args
 
-    # Для memory-инструментов передаём session_id как аргумент
-    if mcp_tool_name in ("save_memory", "read_memory", "delete_memory") and session_id:
+    # Для memory и todo инструментов передаём session_id как аргумент
+    if mcp_tool_name in ("save_memory", "read_memory", "delete_memory", "todo_write", "todo_read") and session_id:
         arguments = {**arguments, "session_id": session_id}
 
     # Если фоновое выполнение - запускаем асинхронно
@@ -601,6 +642,12 @@ class QwenCLIProvider(CLIProvider):
             "--output-format", "stream-json",
             "--approval-mode", "default",
         ]
+
+        # NOTE: MCP config for Qwen временно отключен — нужно проверить формат
+        # mcp_config_path = Path(__file__).parent / "mcp_config.json"
+        # if mcp_config_path.exists():
+        #     cmd.extend(["--mcp-config", str(mcp_config_path)])
+
         if resume_id:
             cmd.extend(["--resume", resume_id])
         elif session_id:
@@ -1039,11 +1086,13 @@ async def stream_chat_background(
                     content_parts = []
                     if msg["content"]:
                         content_parts.append({"type": "text", "text": msg["content"]})
-                    for tc in tool_calls:
+                    for idx, tc in enumerate(tool_calls):
                         func = tc.get("function", {})
+                        # Используем реальный ID если есть, иначе генерируем UUID
+                        tool_id = tc.get("id") or f"tool_{uuid.uuid4().hex[:8]}_{idx}"
                         content_parts.append({
                             "type": "tool_use",
-                            "id": f"tool_{hash(func.get('name', ''))}",
+                            "id": tool_id,
                             "name": func.get("name", ""),
                             "input": func.get("arguments", {})
                         })
@@ -1055,13 +1104,15 @@ async def stream_chat_background(
                     proc.stdin.flush()
                 elif msg["role"] == "tool":
                     # Tool results нужно отправлять как user message с tool_result
+                    # Ищем соответствующий tool_use_id из предыдущего assistant_tool_call сообщения
+                    tool_use_id = msg.get("tool_use_id") or f"tool_{uuid.uuid4().hex[:8]}"
                     msg_data = json.dumps({
                         "type": "user",
                         "message": {
                             "role": "user",
                             "content": [{
                                 "type": "tool_result",
-                                "tool_use_id": f"tool_{hash(msg.get('tool_name', ''))}",
+                                "tool_use_id": tool_use_id,
                                 "content": msg["content"]
                             }]
                         }
@@ -1308,7 +1359,17 @@ async def _process_line(
                     "content": formatted_text
                 })
 
-                # Убиваем процесс qwen
+                # Отправляем системное сообщение что сессия остановлена
+                await _safe_send(ws, {
+                    "type": "content",
+                    "content": "\n\n📌 CLI остановлен для отображения вопросов. Отправьте ответ чтобы продолжить."
+                })
+
+                # Завершаем поток
+                await _safe_send(ws, {"type": "stream_end"})
+                await _safe_send(ws, {"type": "stopped"})
+
+                # Убиваем процесс qwen ПОСЛЕ отправки всех сообщений
                 _kill_proc(proc)
 
                 # Возвращаем formatted_text в content_buffer и done=True
@@ -1467,7 +1528,17 @@ async def _process_line(
                         "content": formatted_text
                     })
 
-                    # Убиваем процесс CLI
+                    # Отправляем системное сообщение что сессия остановлена
+                    await _safe_send(ws, {
+                        "type": "content",
+                        "content": "\n\n📌 CLI остановлен для отображения вопросов. Отправьте ответ чтобы продолжить."
+                    })
+
+                    # Завершаем поток
+                    await _safe_send(ws, {"type": "stream_end"})
+                    await _safe_send(ws, {"type": "stopped"})
+
+                    # Убиваем процесс CLI ПОСЛЕ отправки всех сообщений
                     _kill_proc(proc)
 
                     # Возвращаем formatted_text в content_buffer и done=True
@@ -1479,6 +1550,7 @@ async def _process_line(
 
                 # Конвертируем в формат фронта
                 tool_calls_log.append({
+                    "id": tool_id,
                     "function": {
                         "name": tool_name,
                         "arguments": tool_args
@@ -1498,7 +1570,7 @@ async def _process_line(
                     if connection_state.get("allow_all"):
                         # Выполняем инструмент через MCP
                         try:
-                            result = await run_mcp_tool(tool_name, tool_args, session_id, ws)
+                            result = await run_mcp_tool(tool_name, tool_args, session_id, ws, original_tool_id=tool_id)
                         except Exception as e:
                             result = f"Error: {str(e)}"
 
@@ -1610,7 +1682,7 @@ async def _process_line(
 
                             # Выполняем инструмент через MCP
                             try:
-                                result = await run_mcp_tool(tool_name, tool_args, session_id, ws)
+                                result = await run_mcp_tool(tool_name, tool_args, session_id, ws, original_tool_id=tool_id)
                             except Exception as e:
                                 result = f"Error: {str(e)}"
 

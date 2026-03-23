@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "qwen-agent-tools": {
+      "command": "python3",
+      "args": ["mcp_tools_server.py"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}

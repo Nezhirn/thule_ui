@@ -248,7 +248,6 @@ export function App() {
         setPhase('idle');
         setPhaseStart(null);
         setConfirmRequest(null);
-        setQuestionRequest(null);
         if (currentSessionRef.current) {
           api.fetchMessages(currentSessionRef.current.id).then((msgs) => {
             setMessages(msgs);
@@ -265,7 +264,6 @@ export function App() {
         setPhase('idle');
         setPhaseStart(null);
         setConfirmRequest(null);
-        setQuestionRequest(null);
         setStreaming({ thinking: '', content: '', tools: [] });
         break;
 

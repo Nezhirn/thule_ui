@@ -194,7 +194,7 @@ export default function EmptyState({ hasSession }: Props) {
             className="text-3xl font-extrabold text-text-primary mb-4 tracking-tight"
           >
             Добро пожаловать в{' '}
-            <span className="gradient-text-animated">Qwen Agent</span>
+            <span className="gradient-text-animated">Thule UI</span>
           </motion.h2>
 
           <motion.p

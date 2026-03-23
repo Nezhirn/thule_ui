@@ -105,7 +105,7 @@ export default function Sidebar({
               </motion.div>
               <div>
                 <h1 className="text-base font-bold text-text-primary tracking-tight">
-                  Qwen Agent
+                  Thule UI
                 </h1>
                 <p className="text-[10px] text-text-muted">AI Assistant</p>
               </div>
@@ -258,7 +258,7 @@ export default function Sidebar({
               }}
               transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
             />
-            <span>Qwen Agent • {sessions.length} {pluralize(sessions.length)}</span>
+            <span>Thule UI • {sessions.length} {pluralize(sessions.length)}</span>
           </div>
         </div>
       </aside>
