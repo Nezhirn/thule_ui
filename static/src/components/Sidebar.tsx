@@ -82,8 +82,8 @@ export default function Sidebar({
       <aside
         ref={sidebarRef}
         data-testid="sidebar"
-        className={`fixed lg-relative z-50 h-full w-[280px] glass border-r border-border/50 flex flex-col transition-transform duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] lg:translate-x-0 ${
-          isOpen ? 'translate-x-0' : '-translate-x-full'
+        className={`fixed lg:relative z-50 h-full w-[280px] glass border-r border-border/50 flex flex-col transition-transform duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] ${
+          isOpen ? 'translate-x-0 lg:translate-x-0' : '-translate-x-full'
         }`}
       >
         {/* Header */}
