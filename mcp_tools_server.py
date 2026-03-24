@@ -21,9 +21,11 @@ import sys
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+from html import unescape
 
 from mcp.server.fastmcp import FastMCP
 
@@ -403,51 +405,228 @@ def web_fetch(url: str) -> str:
         return f"Error: {str(e)}"
 
 
-@mcp.tool()
-def web_search(query: str) -> str:
-    """Выполняет поиск в интернете.
+# ─── Веб-поиск: расширенная версия ─────────────────────────────────────
 
-    query: Поисковый запрос.
-    """
+def _search_duckduckgo(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через DuckDuckGo HTML."""
+    results = []
     try:
-        # Используем DuckDuckGo через их HTML интерфейс
         encoded_query = urllib.parse.quote(query)
         url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
 
         req = urllib.request.Request(
             url,
             headers={
-                'User-Agent': 'Mozilla/5.0 (compatible; Qwen-Agent/1.0)',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
             }
         )
 
         with urllib.request.urlopen(req, timeout=30) as response:
             html = response.read().decode('utf-8', errors='ignore')
 
-        # Парсим результаты из HTML
-        results = []
-        # Ищем ссылки в результатах
-        import re
-        matches = re.findall(r'<a class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', html, re.DOTALL)
+        # Парсим заголовки и ссылки
+        title_pattern = re.compile(r'<a class="result__a"[^>]*>(.*?)</a>', re.DOTALL)
+        url_pattern = re.compile(r'<a class="result__a" href="([^"]*)"', re.DOTALL)
+        snippet_pattern = re.compile(r'<a class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
 
-        for href, title in matches[:10]:
-            # Очищаем HTML теги из заголовка
-            clean_title = re.sub(r'<[^>]+>', '', title).strip()
-            # DuckDuckGo возвращает относительные ссылки - конвертируем в абсолютные
-            if href.startswith('/l/?uddg='):
-                # Извлекаем оригинальный URL из редиректа
-                clean_href = urllib.parse.unquote(href.replace('/l/?uddg=', '').split('&rutime=')[0])
-            else:
-                clean_href = href.split('?')[0]
-            results.append(f"- **{clean_title}**\n  [{clean_href}]({clean_href})")
+        titles = title_pattern.findall(html)
+        urls = url_pattern.findall(html)
+        snippets = snippet_pattern.findall(html)
 
-        if not results:
-            return "Ничего не найдено"
+        for i in range(min(len(titles), len(urls), num_results)):
+            title = re.sub(r'<[^>]+>', '', titles[i]).strip()
+            url = urls[i]
 
-        return f"Результаты поиска '{query}':\n\n" + "\n\n".join(results)
+            # Извлекаем оригинальный URL из редиректа DuckDuckGo
+            if url.startswith('/l/?uddg='):
+                url = urllib.parse.unquote(url.replace('/l/?uddg=', '').split('&rutime=')[0])
 
+            snippet = ""
+            if i < len(snippets):
+                snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
+
+            results.append({
+                'title': title,
+                'url': url,
+                'snippet': snippet,
+                'source': 'DuckDuckGo'
+            })
     except Exception as e:
-        return f"Error: {str(e)}"
+        log(f"DuckDuckGo search error: {e}")
+
+    return results
+
+
+def _search_google(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через Google (через HTML версию)."""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://www.google.com/search?q={encoded_query}&num={num_results}"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+
+        # Парсим результаты Google
+        title_pattern = re.compile(r'<h3 class="[^"]*">([^<]*)</h3>')
+        url_pattern = re.compile(r'<a href="([^"]+)"[^>]*>.*?<h3')
+
+        urls = re.findall(r'/url\?q=([^&]+)&', html)
+        titles = title_pattern.findall(html)
+
+        # Фильтруем служебные URL
+        clean_urls = [u for u in urls if not u.startswith(('http://webcache.google', 'https://www.google.com'))]
+
+        for i in range(min(len(titles), len(clean_urls), num_results)):
+            results.append({
+                'title': unescape(re.sub(r'<[^>]+>', '', titles[i])).strip(),
+                'url': urllib.parse.unquote(clean_urls[i]),
+                'snippet': '',
+                'source': 'Google'
+            })
+    except Exception as e:
+        log(f"Google search error: {e}")
+
+    return results
+
+
+def _search_brave(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через Brave Search (если доступен API)."""
+    results = []
+    try:
+        # Пытаемся использовать Brave Search API (если есть ключ)
+        api_key = os.environ.get('BRAVE_SEARCH_API_KEY')
+        if not api_key:
+            return results
+
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://api.search.brave.com/res/v1/web/search?q={encoded_query}&count={num_results}"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; ThuleUI/1.0)',
+                'Accept': 'application/json',
+                'X-Subscription-Token': api_key,
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+
+        web_results = data.get('web', {}).get('results', [])
+        for item in web_results[:num_results]:
+            results.append({
+                'title': item.get('title', ''),
+                'url': item.get('url', ''),
+                'snippet': item.get('description', ''),
+                'source': 'Brave'
+            })
+    except Exception as e:
+        log(f"Brave search error: {e}")
+
+    return results
+
+
+@mcp.tool()
+def web_search(
+    query: str,
+    num_results: int = 10,
+    engine: str = "auto",
+    include_snippets: bool = True
+) -> str:
+    """Выполняет поиск в интернете с поддержкой нескольких движков.
+
+    query: Поисковый запрос.
+    num_results: Количество результатов (по умолчанию 10, макс 20).
+    engine: Поисковая система: 'duckduckgo', 'google', 'brave', 'auto' (все доступные).
+    include_snippets: Включать краткое описание результатов.
+    """
+    # Ограничиваем количество результатов
+    num_results = min(max(1, num_results), 20)
+
+    all_results: List[Dict[str, str]] = []
+    engines_used: List[str] = []
+
+    # Определяем какие движки использовать
+    if engine == "auto":
+        # Используем все доступные движки
+        all_results.extend(_search_duckduckgo(query, num_results))
+        engines_used.append("DuckDuckGo")
+        all_results.extend(_search_google(query, num_results))
+        engines_used.append("Google")
+        brave_results = _search_brave(query, num_results)
+        if brave_results:
+            all_results.extend(brave_results)
+            engines_used.append("Brave")
+
+        # Удаляем дубликаты по URL и сортируем
+        seen_urls = set()
+        unique_results = []
+        for r in all_results:
+            if r['url'] not in seen_urls:
+                seen_urls.add(r['url'])
+                unique_results.append(r)
+
+        all_results = sorted(unique_results, key=lambda x: x.get('title', ''))[:num_results]
+
+    elif engine == "duckduckgo":
+        all_results = _search_duckduckgo(query, num_results)
+        engines_used.append("DuckDuckGo")
+
+    elif engine == "google":
+        all_results = _search_google(query, num_results)
+        engines_used.append("Google")
+
+    elif engine == "brave":
+        all_results = _search_brave(query, num_results)
+        engines_used.append("Brave")
+
+    else:
+        return f"Error: неизвестный поисковый движок '{engine}'. Доступные: duckduckgo, google, brave, auto"
+
+    # Форматируем результат
+    if not all_results:
+        return "❌ Ничего не найдено по запросу."
+
+    # Заголовок с указанием использованных движков
+    output = [f"🔍 Результаты поиска: **{query}**"]
+    output.append(f"_Источники: {', '.join(engines_used)}_\n")
+
+    # Список результатов
+    for i, result in enumerate(all_results, 1):
+        title = result.get('title', 'Без названия')
+        url = result.get('url', '')
+        snippet = result.get('snippet', '')
+        source = result.get('source', '')
+
+        entry = f"**{i}. [{title}]({url})**"
+        if source:
+            entry += f" _(источник: {source})_"
+
+        if include_snippets and snippet:
+            entry += f"\n   > {snippet}"
+
+        output.append(entry)
+
+    # Добавляем источники для цитирования
+    output.append("\n---")
+    output.append("📚 **Источники для цитирования:**")
+    for i, result in enumerate(all_results, 1):
+        output.append(f"{i}. [{result.get('title', 'Без названия')}]({result.get('url', '')})")
+
+    return "\n\n".join(output)
 
 
 # ─── Память ─────────────────────────────────────────────────────
