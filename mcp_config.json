@@ -4,6 +4,11 @@
       "command": "python3",
       "args": ["mcp_tools_server.py"],
       "cwd": "${workspaceFolder}"
+    },
+    "testsprite": {
+      "command": "bash",
+      "args": ["testsprite_mcp_server.sh"],
+      "cwd": "${workspaceFolder}"
     }
   }
 }

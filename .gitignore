@@ -13,6 +13,7 @@ server.log
 DEBUG_UI.html
 test_*.py
 sessions.db
+testsprite_tests/
 *_FIX.md
 *_SUMMARY.md
 *_COMPLETE.md

@@ -12,6 +12,7 @@ import EmptyState from './components/EmptyState';
 import MessageBubble from './components/MessageBubble';
 
 export function App() {
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [currentSession, setCurrentSession] = useState<Session | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -54,7 +55,10 @@ export function App() {
   }, [messages, streaming, scrollToBottom]);
 
   useEffect(() => {
-    api.fetchSessions().then(setSessions).catch(console.error);
+    api.fetchSessions().then(setSessions).catch((error) => {
+      console.error(error);
+      setErrorMessage(error instanceof Error ? error.message : 'Не удалось загрузить список сессий');
+    });
   }, []);
 
   // ─── WebSocket ───
@@ -81,6 +85,7 @@ export function App() {
         reconnectAttempts.current = 0;
         setPhase('idle');
         setWsStatus('connected');
+        setErrorMessage(null);
       };
 
       ws.onmessage = (event) => {
@@ -137,6 +142,7 @@ export function App() {
 
     switch (type) {
       case 'response_start':
+        setErrorMessage(null);
         setIsBusy(true);
         setIsStreamingActive(true);
         setStreaming({ thinking: '', content: '', tools: [] });
@@ -259,6 +265,7 @@ export function App() {
         break;
 
       case 'error':
+        setErrorMessage((data.content as string) || 'Внутренняя ошибка сервера');
         setIsStreamingActive(false);
         setIsBusy(false);
         setPhase('idle');
@@ -316,8 +323,10 @@ export function App() {
       try {
         const msgs = await api.fetchMessages(id);
         setMessages(msgs);
+        setErrorMessage(null);
       } catch (e) {
         console.error('Failed to load messages:', e);
+        setErrorMessage(e instanceof Error ? e.message : 'Не удалось загрузить сообщения');
       }
 
       connectWs(id);
@@ -335,9 +344,11 @@ export function App() {
       setIsStreamingActive(false);
       setIsBusy(false);
       setPhase('idle');
+      setErrorMessage(null);
       connectWs(session.id);
     } catch (e) {
       console.error('Failed to create session:', e);
+      setErrorMessage(e instanceof Error ? e.message : 'Не удалось создать сессию');
     }
   }, [connectWs, provider, model]);
 
@@ -346,6 +357,7 @@ export function App() {
       try {
         await api.deleteSession(id);
         setSessions((prev) => prev.filter((s) => s.id !== id));
+        setErrorMessage(null);
         if (currentSession?.id === id) {
           setCurrentSession(null);
           setMessages([]);
@@ -353,6 +365,7 @@ export function App() {
         }
       } catch (e) {
         console.error('Failed to delete session:', e);
+        setErrorMessage(e instanceof Error ? e.message : 'Не удалось удалить сессию');
       }
     },
     [currentSession, disconnectWs]
@@ -410,6 +423,7 @@ export function App() {
         provider: newProvider,
         model: newProvider === 'claude' ? model : null,
       });
+      setErrorMessage(null);
       // Update local session state
       setSessions((prev) => prev.map((s) =>
         s.id === currentSession.id ? { ...s, provider: newProvider, model: newProvider === 'claude' ? model : null } : s
@@ -417,6 +431,7 @@ export function App() {
       setCurrentSession((prev) => prev ? { ...prev, provider: newProvider, model: newProvider === 'claude' ? model : null } : null);
     } catch (e) {
       console.error('Failed to update provider:', e);
+      setErrorMessage(e instanceof Error ? e.message : 'Не удалось обновить провайдера');
     }
   }, [currentSession, model]);
 
@@ -428,6 +443,7 @@ export function App() {
         provider,
         model: newModel,
       });
+      setErrorMessage(null);
       // Update local session state
       setSessions((prev) => prev.map((s) =>
         s.id === currentSession.id ? { ...s, model: newModel } : s
@@ -435,6 +451,7 @@ export function App() {
       setCurrentSession((prev) => prev ? { ...prev, model: newModel } : null);
     } catch (e) {
       console.error('Failed to update model:', e);
+      setErrorMessage(e instanceof Error ? e.message : 'Не удалось обновить модель');
     }
   }, [currentSession, provider]);
 
@@ -477,6 +494,19 @@ export function App() {
           onProviderChange={handleProviderChange}
           onModelChange={handleModelChange}
         />
+
+        <AnimatePresence>
+          {errorMessage && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="relative z-[2] mx-4 mt-4 rounded-2xl border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-red-100"
+            >
+              {errorMessage}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <AnimatePresence mode="wait">
           {!currentSession ? (

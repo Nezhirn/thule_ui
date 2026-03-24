@@ -22,18 +22,22 @@ import logging
 import os
 import select
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -60,9 +64,14 @@ MCP_SERVER_SCRIPT = str(Path(__file__).parent / "mcp_tools_server.py")
 
 
 
-# Хранилище фоновых задач: {task_id: {"status": "running", "result": None, "session_id": str}}
-background_tasks: dict = {}
-background_tasks_lock = asyncio.Lock()
+# Активные stream-задачи по session_id
+session_tasks: dict = {}
+session_tasks_lock = asyncio.Lock()
+
+# Отдельное хранилище фоновых job-ов инструментов по task_id
+background_jobs: dict = {}
+background_jobs_lock = asyncio.Lock()
+BACKGROUND_JOB_TTL_SECONDS = 3600
 
 # Инструменты требующие подтверждения
 TOOLS_REQUIRING_CONFIRMATION = {
@@ -81,6 +90,49 @@ TOOLS_REQUIRING_CONFIRMATION = {
 
 # Лимиты безопасности
 MAX_REQUEST_SIZE = 50 * 1024 * 1024  # 50 MB
+
+
+class CreateSessionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1, max_length=200)
+    provider: str = Field(default="qwen")
+    model: Optional[str] = None
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Title must not be empty")
+        return value
+
+
+class RenameSessionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Title must not be empty")
+        return value
+
+
+class SessionPromptPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system_prompt: Optional[str] = None
+
+
+class SessionSettingsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    model: Optional[str] = None
 
 
 class RequestSizeLimitMiddleware:
@@ -130,69 +182,61 @@ class SecurityHeadersMiddleware:
 # ─── База данных ────────────────────────────────────────────────
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            title TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            system_prompt TEXT DEFAULT NULL
-        )
-    """)
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN system_prompt TEXT DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN provider TEXT DEFAULT 'qwen'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            thinking TEXT,
-            tool_calls TEXT,
-            tool_name TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(session_id, key)
-        )
-    """)
-    # Индексы для производительности
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_session_id ON memory(session_id)")
-    conn.commit()
-    conn.close()
+    with closing(get_db()) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                system_prompt TEXT DEFAULT NULL
+            )
+        """)
+        for statement in (
+            "ALTER TABLE sessions ADD COLUMN user_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN system_prompt TEXT DEFAULT NULL",
+            "ALTER TABLE sessions ADD COLUMN provider TEXT DEFAULT 'qwen'",
+            "ALTER TABLE sessions ADD COLUMN model TEXT DEFAULT NULL",
+        ):
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                thinking TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, key)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_session_id ON memory(session_id)")
+        conn.commit()
 
 
 def get_db() -> sqlite3.Connection:
     """Создаёт соединение SQLite с правильными настройками."""
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
@@ -233,6 +277,7 @@ def create_session(title="Новый чат", user_id: Optional[str] = None, pro
     conn.close()
     return {
         "id": sid,
+        "sid": sid,
         "title": title,
         "created_at": now,
         "updated_at": now,
@@ -244,18 +289,20 @@ def create_session(title="Новый чат", user_id: Optional[str] = None, pro
 
 def rename_session(sid: str, title: str):
     conn = get_db()
-    conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid))
+    cursor = conn.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (title, datetime.now().isoformat(), sid))
     conn.commit()
     conn.close()
+    return cursor.rowcount > 0
 
 
 def delete_session(sid: str):
     conn = get_db()
     conn.execute("DELETE FROM memory WHERE session_id = ?", (sid,))
     conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-    conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+    cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
     conn.commit()
     conn.close()
+    return cursor.rowcount > 0
 
 
 def get_messages(session_id: str):
@@ -293,12 +340,13 @@ def get_session_prompt(session_id: str) -> Optional[str]:
 
 def set_session_prompt(session_id: str, prompt: Optional[str]):
     conn = get_db()
-    conn.execute(
+    cursor = conn.execute(
         "UPDATE sessions SET system_prompt = ? WHERE id = ?",
         (prompt if prompt and prompt.strip() else None, session_id),
     )
     conn.commit()
     conn.close()
+    return cursor.rowcount > 0
 
 
 def read_memory_for_session(session_id: str) -> list:
@@ -338,6 +386,30 @@ def auto_title(session_id: str, user_msg: str):
         conn.commit()
     conn.close()
     return title if count == 0 else None
+
+
+def normalize_title(title: str, default: str = "Новый чат") -> str:
+    cleaned = (title or "").strip()
+    return cleaned[:200] if cleaned else default
+
+
+def session_exists(sid: str) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+async def cleanup_background_jobs() -> None:
+    cutoff = datetime.now().timestamp() - BACKGROUND_JOB_TTL_SECONDS
+    async with background_jobs_lock:
+        stale_ids = [
+            task_id
+            for task_id, job in background_jobs.items()
+            if job.get("finished_at_ts") and job["finished_at_ts"] < cutoff
+        ]
+        for task_id in stale_ids:
+            background_jobs.pop(task_id, None)
 
 
 # ─── MCP ────────────────────────────────────────────────────────
@@ -537,11 +609,13 @@ async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws
                 result = await mcp_manager.call_tool(mcp_tool_name, arguments, timeout=180.0)
                 result_text = getattr(result, "content", [{"text": str(result)}])[0].text if getattr(result, "content", None) else "(пустой результат)"
 
-                async with background_tasks_lock:
-                    background_tasks[task_id] = {
+                await cleanup_background_jobs()
+                async with background_jobs_lock:
+                    background_jobs[task_id] = {
                         "status": "completed",
                         "result": result_text,
-                        "session_id": session_id
+                        "session_id": session_id,
+                        "finished_at_ts": datetime.now().timestamp(),
                     }
 
                 # Отправляем уведомление через WebSocket если доступен
@@ -557,11 +631,13 @@ async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws
 
             except Exception as e:
                 error_msg = f"Error: {str(e)}"
-                async with background_tasks_lock:
-                    background_tasks[task_id] = {
+                await cleanup_background_jobs()
+                async with background_jobs_lock:
+                    background_jobs[task_id] = {
                         "status": "failed",
                         "result": error_msg,
-                        "session_id": session_id
+                        "session_id": session_id,
+                        "finished_at_ts": datetime.now().timestamp(),
                     }
 
                 if ws:
@@ -575,11 +651,13 @@ async def run_mcp_tool(tool_name: str, arguments: dict, session_id: str = "", ws
                         pass
 
         # Сохраняем задачу как running
-        async with background_tasks_lock:
-            background_tasks[task_id] = {
+        await cleanup_background_jobs()
+        async with background_jobs_lock:
+            background_jobs[task_id] = {
                 "status": "running",
                 "result": None,
-                "session_id": session_id
+                "session_id": session_id,
+                "finished_at_ts": None,
             }
 
         # Запускаем в фоне
@@ -631,9 +709,37 @@ class CLIProvider:
         raise NotImplementedError
 
 
+def resolve_cli_path(env_var: str, binary_name: str, fallback_paths: list[str]) -> str:
+    """Resolve CLI path from env, PATH, or known local installs."""
+    configured_path = os.getenv(env_var)
+    candidates = [configured_path] if configured_path else []
+    path_candidate = shutil.which(binary_name)
+    if path_candidate:
+        candidates.append(path_candidate)
+    candidates.extend(fallback_paths)
+
+    for candidate in candidates:
+        if candidate and Path(candidate).exists() and os.access(candidate, os.X_OK):
+            return candidate
+
+    search_targets = ", ".join(filter(None, [configured_path, binary_name, *fallback_paths]))
+    raise FileNotFoundError(
+        f"Не найден исполняемый файл {binary_name}. "
+        f"Проверьте переменную {env_var} или установку CLI. Проверенные пути: {search_targets}"
+    )
+
+
 class QwenCLIProvider(CLIProvider):
     def get_cli_path(self) -> str:
-        return os.getenv("QWEN_PATH", "/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen")
+        return resolve_cli_path(
+            "QWEN_PATH",
+            "qwen",
+            [
+                "/home/andrew/.nvm/versions/node/v22.12.0/bin/qwen",
+                "/usr/local/bin/qwen",
+                "/usr/bin/qwen",
+            ],
+        )
 
     def get_command(self, session_id: str = None, resume_id: str = None) -> list:
         cmd = [
@@ -666,7 +772,15 @@ class ClaudeCLIProvider(CLIProvider):
         self.model = model
 
     def get_cli_path(self) -> str:
-        return os.getenv("CLAUDE_PATH", "/home/andrew/.npm-global/bin/claude")
+        return resolve_cli_path(
+            "CLAUDE_PATH",
+            "claude",
+            [
+                "/home/andrew/.npm-global/bin/claude",
+                "/usr/local/bin/claude",
+                "/usr/bin/claude",
+            ],
+        )
 
     def get_command(self, session_id: str = None, resume_id: str = None) -> list:
         cmd = [
@@ -754,8 +868,36 @@ def _auto_save_digest(session_id: str, last_user_msg: str):
 
 
 async def _safe_send(ws: WebSocket, data: dict):
+    aliases = []
+    message_type = data.get("type")
+
+    if message_type == "content" and data.get("content"):
+        aliases.append({
+            "type": "assistant.token",
+            "token": data.get("content"),
+            "content": data.get("content"),
+        })
+    elif message_type == "tool_call":
+        aliases.append({
+            "type": "tool.call",
+            "name": data.get("name"),
+            "args": data.get("args", {}),
+        })
+    elif message_type == "tool_result":
+        aliases.append({
+            "type": "tool.result",
+            "name": data.get("name"),
+            "content": data.get("content"),
+        })
+    elif message_type == "response_end":
+        aliases.append({"type": "assistant.done"})
+    elif message_type == "stopped":
+        aliases.append({"type": "assistant.stopped"})
+
     try:
         await ws.send_json(data)
+        for alias in aliases:
+            await ws.send_json(alias)
     except Exception:
         pass
 
@@ -877,6 +1019,20 @@ async def _async_readline(proc) -> str:
         return ""  # Нет данных — вернём пустую строку, вызывающий повторит
     
     return await loop.run_in_executor(None, _readline_with_poll)
+
+
+def _read_stderr_tail(proc, max_bytes: int = 4000) -> str:
+    if proc is None or proc.stderr is None:
+        return ""
+    try:
+        fd = proc.stderr.fileno()
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            return ""
+        chunk = os.read(fd, max_bytes)
+        return chunk.decode(errors="ignore").strip()
+    except Exception:
+        return ""
 
 
 def _kill_proc(proc):
@@ -1021,6 +1177,7 @@ async def stream_chat_background(
         # Fallback: если процесс умер (например --resume на несуществующей сессии)
         if init_resp is None and proc.poll() is not None:
             logger.warning(f"{provider.get_provider_name()} процесс завершился, пробуем без --resume (session_id={session_id})")
+            stderr_tail = _read_stderr_tail(proc)
             proc = run_cli_sdk(provider)
             init_msg_fallback = json.dumps({
                 "type": "control_request",
@@ -1029,8 +1186,17 @@ async def stream_chat_background(
             })
             proc.stdin.write(init_msg_fallback + "\n")
             proc.stdin.flush()
-            await _wait_for_init_response(proc)
+            init_resp = await _wait_for_init_response(proc)
             use_full_history = True  # После fallback отправляем полную историю
+            if init_resp is None:
+                fallback_stderr = _read_stderr_tail(proc)
+                stderr_tail = fallback_stderr or stderr_tail
+                details = f" STDERR: {stderr_tail[:1000]}" if stderr_tail else ""
+                raise RuntimeError(f"{provider.get_provider_name()} не ответил на initialize после fallback.{details}")
+        elif init_resp is None:
+            stderr_tail = _read_stderr_tail(proc)
+            details = f" STDERR: {stderr_tail[:1000]}" if stderr_tail else ""
+            raise RuntimeError(f"{provider.get_provider_name()} не ответил на initialize.{details}")
 
         # 2. Отправляем полную историю если нужно (кастомный промпт или fallback)
         if use_full_history:
@@ -1421,9 +1587,11 @@ async def _process_line(
                     proc.stdin.flush()
                 except Exception:
                     pass
-                return thinking_buffer, content_buffer, False, last_tool_call_time
+                _kill_proc(proc)
+                return thinking_buffer, content_buffer, True, last_tool_call_time
 
             elif action == "deny":
+                stop_event.set()
                 deny_resp = json.dumps({
                     "type": "control_response",
                     "response": {
@@ -1438,7 +1606,8 @@ async def _process_line(
                 except Exception:
                     pass
                 await _safe_send(ws, {"type": "tool_denied", "name": tool_name})
-                return thinking_buffer, content_buffer, False, last_tool_call_time
+                _kill_proc(proc)
+                return thinking_buffer, content_buffer, True, last_tool_call_time
 
             else:
                 # allow или allow_all
@@ -1647,6 +1816,8 @@ async def _process_line(
                             if tool_id in pending_tool_calls:
                                 del pending_tool_calls[tool_id]
                             last_tool_call_time = None
+                            _kill_proc(proc)
+                            return thinking_buffer, content_buffer, True, last_tool_call_time
 
                         elif action == "deny":
                             # Отправляем error result в Claude
@@ -1673,6 +1844,8 @@ async def _process_line(
                             if tool_id in pending_tool_calls:
                                 del pending_tool_calls[tool_id]
                             last_tool_call_time = None
+                            _kill_proc(proc)
+                            return thinking_buffer, content_buffer, True, last_tool_call_time
 
                         else:
                             # allow или allow_all
@@ -1795,6 +1968,11 @@ app.add_middleware(
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestSizeLimitMiddleware)
 
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=400, content={"detail": jsonable_encoder(exc.errors())})
+
 # Раздача статики React build (JS, CSS, images)
 _dist_dir = Path(__file__).parent / "static" / "dist"
 if _dist_dir.exists():
@@ -1826,13 +2004,18 @@ async def health_check():
         conn.execute("SELECT 1")
         conn.close()
         db_ok = True
-    except Exception:
+    except Exception as exc:
+        logger.error(f"Health check database failure: {exc}", exc_info=True)
         db_ok = False
-    return {
-        "status": "ok" if db_ok else "degraded",
+    payload = {
+        "status": "ok" if db_ok else "error",
         "database": db_ok,
+        "db": "ok" if db_ok else "down",
         "version": "1.0.0"
     }
+    if db_ok:
+        return payload
+    return JSONResponse(status_code=500, content=payload)
 
 
 @app.get("/api/sessions")
@@ -1840,43 +2023,48 @@ async def api_sessions():
     return get_sessions()
 
 
-@app.post("/api/sessions")
-async def api_create_session(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    title = body.get("title", "Новый чат")
-    provider = body.get("provider", "qwen")
-    model = body.get("model")
-    return create_session(title, provider=provider, model=model)
+@app.post("/api/sessions", status_code=201)
+async def api_create_session(payload: CreateSessionPayload):
+    session = create_session(
+        normalize_title(payload.title),
+        provider=payload.provider,
+        model=payload.model,
+    )
+    return session
 
 
 @app.delete("/api/sessions/{sid}")
 async def api_delete_session(sid: str):
     # Остановить активную задачу если есть
-    if sid in background_tasks:
-        background_tasks[sid]["stop_event"].set()
-        # Даём время на завершение
-        task = background_tasks[sid]["task"]
+    async with session_tasks_lock:
+        task_info = session_tasks.get(sid)
+    if task_info:
+        task_info["stop_event"].set()
+        task = task_info["task"]
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=3)
         except (asyncio.TimeoutError, Exception):
             pass
-    delete_session(sid)
-    return {"ok": True}
+    deleted = delete_session(sid)
+    if not deleted:
+        raise HTTPException(404, "Session not found")
+    return Response(status_code=204)
 
 
 @app.put("/api/sessions/{sid}")
-async def api_rename_session(sid: str, request: Request):
-    body = await request.json()
-    rename_session(sid, body.get("title", ""))
-    return {"ok": True}
+async def api_rename_session(sid: str, payload: RenameSessionPayload):
+    title = normalize_title(payload.title, default="")
+    renamed = rename_session(sid, title)
+    if not renamed:
+        raise HTTPException(404, "Session not found")
+    return {"ok": True, "id": sid, "sid": sid, "title": title}
 
 
 @app.get("/api/sessions/{sid}/messages")
 async def api_messages(sid: str, limit: int = 50, offset: int = 0):
     """Получить сообщения сессии с пагинацией."""
+    if not session_exists(sid):
+        raise HTTPException(404, "Session not found")
     conn = get_db()
     conn.row_factory = sqlite3.Row
     total = conn.execute(
@@ -1897,29 +2085,42 @@ async def api_default_prompt():
 
 @app.get("/api/sessions/{sid}/system-prompt")
 async def api_get_system_prompt(sid: str):
+    if not session_exists(sid):
+        raise HTTPException(404, "Session not found")
     custom = get_session_prompt(sid)
     return {"system_prompt": custom, "default_prompt": SYSTEM_PROMPT}
 
 
 @app.put("/api/sessions/{sid}/system-prompt")
-async def api_set_system_prompt(sid: str, request: Request):
-    body = await request.json()
-    prompt = body.get("system_prompt")
-    set_session_prompt(sid, prompt)
+async def api_set_system_prompt(sid: str, payload: SessionPromptPayload):
+    prompt = payload.system_prompt
+    updated = set_session_prompt(sid, prompt)
+    if not updated:
+        raise HTTPException(404, "Session not found")
     return {"ok": True, "system_prompt": prompt}
 
 
 @app.patch("/api/sessions/{sid}/settings")
-async def api_update_session_settings(sid: str, request: Request):
+async def api_update_session_settings(sid: str, payload: SessionSettingsPayload):
     """Update session provider and model settings."""
-    body = await request.json()
-    provider = body.get("provider")
-    model = body.get("model")
+    provider = payload.provider
+    model = payload.model
 
     if provider not in ["qwen", "claude"]:
         raise HTTPException(400, "Invalid provider")
 
     conn = get_db()
+    existing = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(404, "Session not found")
+
+    if provider == "claude":
+        if model not in ["opus", "sonnet", "haiku"]:
+            model = "sonnet"
+    else:
+        model = None
+
     conn.execute(
         "UPDATE sessions SET provider = ?, model = ?, updated_at = ? WHERE id = ?",
         (provider, model, datetime.now().isoformat(), sid)
@@ -1932,8 +2133,11 @@ async def api_update_session_settings(sid: str, request: Request):
 
 @app.get("/api/sessions/{sid}/task-status")
 async def api_task_status(sid: str):
-    if sid in background_tasks:
-        task_info = background_tasks[sid]
+    if not session_exists(sid):
+        raise HTTPException(404, "Session not found")
+    async with session_tasks_lock:
+        task_info = session_tasks.get(sid)
+    if task_info:
         return {"has_task": True, "done": task_info["task"].done(), "cancelled": task_info["task"].cancelled()}
     return {"has_task": False}
 
@@ -2032,6 +2236,10 @@ async def api_export_session(sid: str):
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(ws: WebSocket, session_id: str):
     await ws.accept()
+    if not session_exists(session_id):
+        await ws.send_json({"type": "error", "content": "Session not found"})
+        await ws.close(code=1008)
+        return
     logger.info(f"WebSocket подключен: {session_id}")
 
     connection_state = {"allow_all": False}
@@ -2051,21 +2259,30 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                         break  # Не можем отправить — соединение разорвано
                     continue
                 logger.debug(f"Получено сообщение: {data.get('type')}")
-                if data.get("type") == "stop":
-                    if session_id in background_tasks:
-                        background_tasks[session_id]["stop_event"].set()
-                elif data.get("type") == "confirm_response":
-                    if session_id in background_tasks:
-                        await background_tasks[session_id]["confirm_queue"].put(
-                            data.get("action", "deny")
-                        )
-                elif data.get("type") == "set_allow_all":
+                message_type = data.get("type")
+
+                if message_type in ("stop", "assistant.stop"):
+                    async with session_tasks_lock:
+                        task_info = session_tasks.get(session_id)
+                    if task_info:
+                        task_info["stop_event"].set()
+                elif message_type in ("confirm_response", "confirm"):
+                    action = data.get("action")
+                    if action is None and isinstance(data.get("allow"), bool):
+                        action = "allow" if data.get("allow") else "deny"
+                    async with session_tasks_lock:
+                        task_info = session_tasks.get(session_id)
+                    if task_info:
+                        await task_info["confirm_queue"].put(action or "deny")
+                elif message_type == "set_allow_all":
                     connection_state["allow_all"] = data.get("value", False)
                     await _safe_send(ws, {
                         "type": "allow_all_changed",
                         "value": connection_state["allow_all"]
                     })
                 else:
+                    if message_type == "input":
+                        data = {"type": "message", "content": data.get("text", "")}
                     await msg_queue.put(data)
         except WebSocketDisconnect as e:
             # Нормальное закрытие соединения — не логируем как ошибку
@@ -2091,6 +2308,9 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                 # Reader завершил работу — соединение закрыто
                 break
             if item.get("type") == "message":
+                if not isinstance(item.get("content"), str) or not item["content"].strip():
+                    await _safe_send(ws, {"type": "error", "content": "Пустое сообщение не поддерживается"})
+                    continue
                 logger.info(f"Обработка сообщения для сессии {session_id}: {item['content'][:50]}...")
                 stop_event.clear()
 
@@ -2103,11 +2323,12 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                     )
                 )
 
-                background_tasks[session_id] = {
-                    "task": background_task,
-                    "stop_event": task_stop_event,
-                    "confirm_queue": confirm_queue,
-                }
+                async with session_tasks_lock:
+                    session_tasks[session_id] = {
+                        "task": background_task,
+                        "stop_event": task_stop_event,
+                        "confirm_queue": confirm_queue,
+                    }
 
                 try:
                     await background_task
@@ -2116,13 +2337,15 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                     # Задача была отменена - корректно завершаем
                     logger.info(f"Задача отменена для сессии {session_id}")
                     # Отправляем сигнал остановки в background_task через confirm_queue
-                    if session_id in background_tasks:
+                    async with session_tasks_lock:
+                        task_info = session_tasks.get(session_id)
+                    if task_info:
                         try:
-                            await background_tasks[session_id]["confirm_queue"].put(None)
+                            await task_info["confirm_queue"].put(None)
                         except Exception:
                             pass
                         # Принудительно останавливаем задачу
-                        background_tasks[session_id]["stop_event"].set()
+                        task_info["stop_event"].set()
                         try:
                             await asyncio.wait_for(background_task, timeout=2)
                         except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -2136,23 +2359,27 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
                     except Exception:
                         break
                 finally:
-                    if session_id in background_tasks and background_tasks[session_id]["task"] == background_task:
-                        del background_tasks[session_id]
+                    async with session_tasks_lock:
+                        task_info = session_tasks.get(session_id)
+                        if task_info and task_info["task"] == background_task:
+                            del session_tasks[session_id]
     except asyncio.CancelledError:
         # Нормальное завершение при shutdown - отменяем все задачи
-        if session_id in background_tasks:
-            background_tasks[session_id]["stop_event"].set()
+        async with session_tasks_lock:
+            task_info = session_tasks.get(session_id)
+        if task_info:
+            task_info["stop_event"].set()
             try:
-                await background_tasks[session_id]["confirm_queue"].put(None)
+                await task_info["confirm_queue"].put(None)
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(background_tasks[session_id]["task"], timeout=2)
+                await asyncio.wait_for(task_info["task"], timeout=2)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                background_tasks[session_id]["task"].cancel()
+                task_info["task"].cancel()
             finally:
-                if session_id in background_tasks:
-                    del background_tasks[session_id]
+                async with session_tasks_lock:
+                    session_tasks.pop(session_id, None)
     except Exception as e:
         logger.error(f"WebSocket ошибка: {e}", exc_info=True)
     finally:
@@ -2163,19 +2390,21 @@ async def websocket_endpoint(ws: WebSocket, session_id: str):
         except (asyncio.CancelledError, Exception):
             pass
         # Также отменяем background_task если она ещё выполняется
-        if session_id in background_tasks:
-            background_tasks[session_id]["stop_event"].set()
+        async with session_tasks_lock:
+            task_info = session_tasks.get(session_id)
+        if task_info:
+            task_info["stop_event"].set()
             try:
-                await background_tasks[session_id]["confirm_queue"].put(None)
+                await task_info["confirm_queue"].put(None)
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(background_tasks[session_id]["task"], timeout=2)
+                await asyncio.wait_for(task_info["task"], timeout=2)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                background_tasks[session_id]["task"].cancel()
+                task_info["task"].cancel()
             finally:
-                if session_id in background_tasks:
-                    del background_tasks[session_id]
+                async with session_tasks_lock:
+                    session_tasks.pop(session_id, None)
         logger.info(f"WebSocket сессия завершена: {session_id}")
 
 
