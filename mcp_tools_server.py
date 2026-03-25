@@ -407,6 +407,52 @@ def web_fetch(url: str) -> str:
 
 # ─── Веб-поиск: расширенная версия ─────────────────────────────────────
 
+def _search_searxng(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через публичный SearxNG (мета-поисковик)."""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
+        # Используем публичный инстанс SearxNG
+        instances = [
+            "https://searx.be",
+            "https://search.ononoki.org",
+            "https://searx.org",
+        ]
+
+        for base_url in instances:
+            try:
+                url = f"{base_url}/search?q={encoded_query}&format=json&categories=general"
+
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'application/json',
+                    }
+                )
+
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+
+                for item in data.get('results', [])[:num_results]:
+                    results.append({
+                        'title': item.get('title', ''),
+                        'url': item.get('url', ''),
+                        'snippet': item.get('content', ''),
+                        'source': 'SearxNG'
+                    })
+
+                if results:
+                    break  # Успешно получили результаты
+            except Exception:
+                continue  # Пробуем следующий инстанс
+
+    except Exception as e:
+        log(f"SearxNG search error: {e}")
+
+    return results
+
+
 def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str, str]]:
     """Поиск через DuckDuckGo Lite (более надежный)."""
     results = []
@@ -428,15 +474,27 @@ def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str,
         with urllib.request.urlopen(req, timeout=30) as response:
             html = response.read().decode('utf-8', errors='ignore')
 
+        log(f"DuckDuckGo Lite response length: {len(html)}")
+
         # Парсим результаты из lite версии
-        # Формат: <a class="result-link" href="...">заголовок</a>
-        link_pattern = re.compile(r'<a class="result-link" href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
-        # Также пробуем альтернативный формат
-        alt_pattern = re.compile(r'<a[^>]*href="(https?://[^"]+)"[^>]*class="[^"]*result[^"]*"[^>]*>(.*?)</a>', re.DOTALL)
+        # Лайт версия использует таблицу с классом result
+        # Ищем все ссылки которые не начинаются с /lite/
+        link_pattern = re.compile(r'<tr class="result"><td.*?><a href="([^"]+)" class="result-link"[^>]*>(.*?)</a>', re.DOTALL)
 
         matches = link_pattern.findall(html)
+
+        # Альтернативный парсинг - ищем все внешние ссылки
         if not matches:
+            alt_pattern = re.compile(r'<a href="(https?://[^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', re.DOTALL)
             matches = alt_pattern.findall(html)
+
+        # Еще одна попытка - просто ищем заголовки
+        if not matches:
+            simple_pattern = re.compile(r'<a href="([^"]+)"[^>]*>([^<]+)</a>')
+            all_links = simple_pattern.findall(html)
+            # Фильтруем внутренние ссылки
+            matches = [(url, title) for url, title in all_links
+                      if url.startswith('http') and 'duckduckgo' not in url.lower()]
 
         for href, title in matches[:num_results]:
             clean_title = re.sub(r'<[^>]+>', '', title).strip()
@@ -449,6 +507,8 @@ def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str,
                     'snippet': '',
                     'source': 'DuckDuckGo Lite'
                 })
+
+        log(f"DuckDuckGo Lite found {len(results)} results")
     except Exception as e:
         log(f"DuckDuckGo Lite search error: {e}")
 
@@ -646,29 +706,39 @@ def web_search(
 
     # Определяем какие движки использовать
     if engine == "auto":
-        # Начинаем с DuckDuckGo Lite - самый надежный
-        lite_results = _search_duckduckgo_lite(query, num_results)
-        if lite_results:
-            all_results.extend(lite_results)
-            engines_used.append("DuckDuckGo Lite")
+        # SearxNG как первый источник - мета-поисковик, более надежен
+        searx_results = _search_searxng(query, num_results)
+        if searx_results:
+            all_results.extend(searx_results)
+            engines_used.append("SearxNG")
+
+        # DuckDuckGo Lite как второй источник
+        if len(all_results) < num_results:
+            lite_results = _search_duckduckgo_lite(query, num_results)
+            if lite_results:
+                all_results.extend(lite_results)
+                engines_used.append("DuckDuckGo Lite")
 
         # Затем обычный DuckDuckGo
-        ddg_results = _search_duckduckgo(query, num_results)
-        if ddg_results:
-            all_results.extend(ddg_results)
-            engines_used.append("DuckDuckGo")
+        if len(all_results) < num_results:
+            ddg_results = _search_duckduckgo(query, num_results)
+            if ddg_results:
+                all_results.extend(ddg_results)
+                engines_used.append("DuckDuckGo")
 
         # Google как дополнительный источник
-        google_results = _search_google(query, num_results)
-        if google_results:
-            all_results.extend(google_results)
-            engines_used.append("Google")
+        if len(all_results) < num_results:
+            google_results = _search_google(query, num_results)
+            if google_results:
+                all_results.extend(google_results)
+                engines_used.append("Google")
 
         # Brave API если есть ключ
-        brave_results = _search_brave(query, num_results)
-        if brave_results:
-            all_results.extend(brave_results)
-            engines_used.append("Brave")
+        if len(all_results) < num_results:
+            brave_results = _search_brave(query, num_results)
+            if brave_results:
+                all_results.extend(brave_results)
+                engines_used.append("Brave")
 
         # Если ничего не найдено - пробуем Wikipedia
         if not all_results:
@@ -677,7 +747,7 @@ def web_search(
                 all_results.extend(wiki_results)
                 engines_used.append("Wikipedia")
 
-        # Удаляем дубликаты по URL и сортируем
+        # Удаляем дубликаты по URL
         seen_urls = set()
         unique_results = []
         for r in all_results:
@@ -688,7 +758,10 @@ def web_search(
         all_results = unique_results[:num_results]
 
     elif engine == "duckduckgo":
-        all_results = _search_duckduckgo_lite(query, num_results)
+        # Пробуем оба варианта DuckDuckGo
+        all_results = _search_searxng(query, num_results)
+        if not all_results:
+            all_results = _search_duckduckgo_lite(query, num_results)
         if not all_results:
             all_results = _search_duckduckgo(query, num_results)
         engines_used.append("DuckDuckGo")
