@@ -407,16 +407,72 @@ def web_fetch(url: str) -> str:
 
 # ─── Веб-поиск: расширенная версия ─────────────────────────────────────
 
+def _search_duckduckgo_api(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через DuckDuckGo Instant Answer API (официальный, надежный)."""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
+        # DuckDuckGo Instant Answer API - бесплатный, не требует ключа
+        url = f"https://api.duckduckgo.com/?q={encoded_query}&format=json&pretty=1"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+
+        # Извлекаем результаты
+        abstract = data.get('Abstract', '')
+        abstract_url = data.get('AbstractURL', '')
+        abstract_source = data.get('AbstractSource', '')
+
+        if abstract:
+            results.append({
+                'title': abstract_source,
+                'url': abstract_url,
+                'snippet': abstract,
+                'source': 'DuckDuckGo'
+            })
+
+        # Related topics
+        for topic in data.get('RelatedTopics', [])[:num_results]:
+            if isinstance(topic, dict):
+                text = topic.get('Text', '')
+                first_url = topic.get('FirstURL', '')
+                icon = topic.get('Icon', {})
+                icon_url = icon.get('URL', '') if icon else ''
+
+                if text and first_url:
+                    results.append({
+                        'title': text.split(' - ')[0] if ' - ' in text else text,
+                        'url': first_url,
+                        'snippet': text,
+                        'source': 'DuckDuckGo'
+                    })
+
+        log(f"DuckDuckGo API found {len(results)} results")
+    except Exception as e:
+        log(f"DuckDuckGo API search error: {e}")
+
+    return results
+
+
 def _search_searxng(query: str, num_results: int = 10) -> List[Dict[str, str]]:
     """Поиск через публичный SearxNG (мета-поисковик)."""
     results = []
     try:
         encoded_query = urllib.parse.quote(query)
-        # Используем публичный инстанс SearxNG
+        # Используем публичный инстанс SearxNG с лучшим User-Agent
         instances = [
             "https://searx.be",
             "https://search.ononoki.org",
-            "https://searx.org",
+            "https://searx.tiekoetter.com",
+            "https://searx.lvdl.site",
         ]
 
         for base_url in instances:
@@ -428,6 +484,7 @@ def _search_searxng(query: str, num_results: int = 10) -> List[Dict[str, str]]:
                     headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                         'Accept': 'application/json',
+                        'Accept-Language': 'en-US,en;q=0.9',
                     }
                 )
 
@@ -444,7 +501,8 @@ def _search_searxng(query: str, num_results: int = 10) -> List[Dict[str, str]]:
 
                 if results:
                     break  # Успешно получили результаты
-            except Exception:
+            except Exception as e:
+                log(f"SearxNG {base_url}: {e}")
                 continue  # Пробуем следующий инстанс
 
     except Exception as e:
@@ -706,41 +764,34 @@ def web_search(
 
     # Определяем какие движки использовать
     if engine == "auto":
-        # SearxNG как первый источник - мета-поисковик, более надежен
-        searx_results = _search_searxng(query, num_results)
-        if searx_results:
-            all_results.extend(searx_results)
-            engines_used.append("SearxNG")
+        # DuckDuckGo API - официальный, самый надежный (не блокируется)
+        ddg_api_results = _search_duckduckgo_api(query, num_results)
+        if ddg_api_results:
+            all_results.extend(ddg_api_results)
+            engines_used.append("DuckDuckGo API")
 
-        # DuckDuckGo Lite как второй источник
+        # DuckDuckGo Lite - второй источник
         if len(all_results) < num_results:
             lite_results = _search_duckduckgo_lite(query, num_results)
             if lite_results:
                 all_results.extend(lite_results)
                 engines_used.append("DuckDuckGo Lite")
 
-        # Затем обычный DuckDuckGo
+        # DuckDuckGo HTML - третий источник
         if len(all_results) < num_results:
             ddg_results = _search_duckduckgo(query, num_results)
             if ddg_results:
                 all_results.extend(ddg_results)
                 engines_used.append("DuckDuckGo")
 
-        # Google как дополнительный источник
+        # SearxNG - мета-поисковик (если доступен)
         if len(all_results) < num_results:
-            google_results = _search_google(query, num_results)
-            if google_results:
-                all_results.extend(google_results)
-                engines_used.append("Google")
+            searx_results = _search_searxng(query, num_results)
+            if searx_results:
+                all_results.extend(searx_results)
+                engines_used.append("SearxNG")
 
-        # Brave API если есть ключ
-        if len(all_results) < num_results:
-            brave_results = _search_brave(query, num_results)
-            if brave_results:
-                all_results.extend(brave_results)
-                engines_used.append("Brave")
-
-        # Если ничего не найдено - пробуем Wikipedia
+        # Wikipedia - запасной вариант
         if not all_results:
             wiki_results = _search_wikipedia(query)
             if wiki_results:
@@ -758,8 +809,8 @@ def web_search(
         all_results = unique_results[:num_results]
 
     elif engine == "duckduckgo":
-        # Пробуем оба варианта DuckDuckGo
-        all_results = _search_searxng(query, num_results)
+        # Пробуем все варианты DuckDuckGo
+        all_results = _search_duckduckgo_api(query, num_results)
         if not all_results:
             all_results = _search_duckduckgo_lite(query, num_results)
         if not all_results:
