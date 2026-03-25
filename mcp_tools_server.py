@@ -407,6 +407,54 @@ def web_fetch(url: str) -> str:
 
 # ─── Веб-поиск: расширенная версия ─────────────────────────────────────
 
+def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через DuckDuckGo Lite (более надежный)."""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
+        # Используем lite версию - она более стабильна
+        url = f"https://lite.duckduckgo.com/lite/?q={encoded_query}"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'DNT': '1',
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+
+        # Парсим результаты из lite версии
+        # Формат: <a class="result-link" href="...">заголовок</a>
+        link_pattern = re.compile(r'<a class="result-link" href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
+        # Также пробуем альтернативный формат
+        alt_pattern = re.compile(r'<a[^>]*href="(https?://[^"]+)"[^>]*class="[^"]*result[^"]*"[^>]*>(.*?)</a>', re.DOTALL)
+
+        matches = link_pattern.findall(html)
+        if not matches:
+            matches = alt_pattern.findall(html)
+
+        for href, title in matches[:num_results]:
+            clean_title = re.sub(r'<[^>]+>', '', title).strip()
+            clean_href = href.split('&')[0] if '&' in href else href
+
+            if clean_href and clean_title:
+                results.append({
+                    'title': clean_title,
+                    'url': clean_href,
+                    'snippet': '',
+                    'source': 'DuckDuckGo Lite'
+                })
+    except Exception as e:
+        log(f"DuckDuckGo Lite search error: {e}")
+
+    return results
+
+
 def _search_duckduckgo(query: str, num_results: int = 10) -> List[Dict[str, str]]:
     """Поиск через DuckDuckGo HTML."""
     results = []
@@ -539,6 +587,43 @@ def _search_brave(query: str, num_results: int = 10) -> List[Dict[str, str]]:
     return results
 
 
+def _search_wikipedia(query: str) -> List[Dict[str, str]]:
+    """Поиск через Wikipedia API."""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
+        # Используем Wikipedia API для поиска
+        url = f"https://ru.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded_query}&format=json&srlimit=10"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; ThuleUI/1.0)',
+                'Accept': 'application/json',
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+
+        search_results = data.get('query', {}).get('search', [])
+        for item in search_results[:10]:
+            title = item.get('title', '')
+            snippet = item.get('snippet', '')
+            # Убираем HTML теги из сниппета
+            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            results.append({
+                'title': title,
+                'url': f"https://ru.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}",
+                'snippet': clean_snippet,
+                'source': 'Wikipedia'
+            })
+    except Exception as e:
+        log(f"Wikipedia search error: {e}")
+
+    return results
+
+
 @mcp.tool()
 def web_search(
     query: str,
@@ -561,15 +646,36 @@ def web_search(
 
     # Определяем какие движки использовать
     if engine == "auto":
-        # Используем все доступные движки
-        all_results.extend(_search_duckduckgo(query, num_results))
-        engines_used.append("DuckDuckGo")
-        all_results.extend(_search_google(query, num_results))
-        engines_used.append("Google")
+        # Начинаем с DuckDuckGo Lite - самый надежный
+        lite_results = _search_duckduckgo_lite(query, num_results)
+        if lite_results:
+            all_results.extend(lite_results)
+            engines_used.append("DuckDuckGo Lite")
+
+        # Затем обычный DuckDuckGo
+        ddg_results = _search_duckduckgo(query, num_results)
+        if ddg_results:
+            all_results.extend(ddg_results)
+            engines_used.append("DuckDuckGo")
+
+        # Google как дополнительный источник
+        google_results = _search_google(query, num_results)
+        if google_results:
+            all_results.extend(google_results)
+            engines_used.append("Google")
+
+        # Brave API если есть ключ
         brave_results = _search_brave(query, num_results)
         if brave_results:
             all_results.extend(brave_results)
             engines_used.append("Brave")
+
+        # Если ничего не найдено - пробуем Wikipedia
+        if not all_results:
+            wiki_results = _search_wikipedia(query)
+            if wiki_results:
+                all_results.extend(wiki_results)
+                engines_used.append("Wikipedia")
 
         # Удаляем дубликаты по URL и сортируем
         seen_urls = set()
@@ -579,10 +685,12 @@ def web_search(
                 seen_urls.add(r['url'])
                 unique_results.append(r)
 
-        all_results = sorted(unique_results, key=lambda x: x.get('title', ''))[:num_results]
+        all_results = unique_results[:num_results]
 
     elif engine == "duckduckgo":
-        all_results = _search_duckduckgo(query, num_results)
+        all_results = _search_duckduckgo_lite(query, num_results)
+        if not all_results:
+            all_results = _search_duckduckgo(query, num_results)
         engines_used.append("DuckDuckGo")
 
     elif engine == "google":
@@ -596,13 +704,26 @@ def web_search(
     else:
         return f"Error: неизвестный поисковый движок '{engine}'. Доступные: duckduckgo, google, brave, auto"
 
+    # Логирование для отладки
+    log(f"Web search: query='{query}', engine='{engine}', found {len(all_results)} results")
+
     # Форматируем результат
     if not all_results:
-        return "❌ Ничего не найдено по запросу."
+        # Возвращаем полезное сообщение с альтернативами
+        return f"""❌ Ничего не найдено по запросу: **{query}**
+
+Возможные причины:
+- Поисковые системы блокируют автоматические запросы
+- Временные проблемы с сетью
+
+Попробуйте:
+1. Изменить формулировку запроса
+2. Использовать WebFetch с конкретным URL
+3. Посетить напрямую: https://duckduckgo.com/?q={urllib.parse.quote(query)}"""
 
     # Заголовок с указанием использованных движков
     output = [f"🔍 Результаты поиска: **{query}**"]
-    output.append(f"_Источники: {', '.join(engines_used)}_\n")
+    output.append(f"_Источники: {', '.join(engines_used)}_ (найдено: {len(all_results)})\n")
 
     # Список результатов
     for i, result in enumerate(all_results, 1):
