@@ -511,12 +511,73 @@ def _search_searxng(query: str, num_results: int = 10) -> List[Dict[str, str]]:
     return results
 
 
-def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str, str]]:
-    """Поиск через DuckDuckGo Lite (более надежный)."""
+def _search_duckduckgo_html(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через DuckDuckGo HTML (основной метод)."""
     results = []
     try:
         encoded_query = urllib.parse.quote(query)
-        # Используем lite версию - она более стабильна
+        url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive',
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+
+        log(f"DuckDuckGo HTML response length: {len(html)}")
+
+        # Парсим заголовки
+        title_pattern = re.compile(r'<a class="result__a"[^>]*>(.*?)</a>', re.DOTALL)
+        # Парсим URL
+        url_pattern = re.compile(r'<a class="result__a" href="([^"]*)"', re.DOTALL)
+        # Парсим сниппеты
+        snippet_pattern = re.compile(r'<a class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
+
+        titles = title_pattern.findall(html)
+        urls = url_pattern.findall(html)
+        snippets = snippet_pattern.findall(html)
+
+        log(f"DuckDuckGo HTML parsed: {len(titles)} titles, {len(urls)} urls, {len(snippets)} snippets")
+
+        for i in range(min(len(titles), len(urls), num_results)):
+            title = re.sub(r'<[^>]+>', '', titles[i]).strip()
+            url = urls[i]
+
+            # Извлекаем оригинальный URL из редиректа
+            if url.startswith('/l/?uddg='):
+                url = urllib.parse.unquote(url.replace('/l/?uddg=', '').split('&rutime=')[0])
+
+            snippet = ""
+            if i < len(snippets):
+                snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
+
+            if title and url:
+                results.append({
+                    'title': title,
+                    'url': url,
+                    'snippet': snippet,
+                    'source': 'DuckDuckGo'
+                })
+
+        log(f"DuckDuckGo HTML found {len(results)} results")
+    except Exception as e:
+        log(f"DuckDuckGo HTML search error: {e}")
+
+    return results
+
+
+def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str, str]]:
+    """Поиск через DuckDuckGo Lite (резервный метод)."""
+    results = []
+    try:
+        encoded_query = urllib.parse.quote(query)
         url = f"https://lite.duckduckgo.com/lite/?q={encoded_query}"
 
         req = urllib.request.Request(
@@ -534,29 +595,16 @@ def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str,
 
         log(f"DuckDuckGo Lite response length: {len(html)}")
 
-        # Парсим результаты из lite версии
-        # Лайт версия использует таблицу с классом result
-        # Ищем все ссылки которые не начинаются с /lite/
-        link_pattern = re.compile(r'<tr class="result"><td.*?><a href="([^"]+)" class="result-link"[^>]*>(.*?)</a>', re.DOTALL)
-
+        # Ищем все внешние ссылки
+        link_pattern = re.compile(r'<a href="(https?://[^"]+)"[^>]*>([^<]+)</a>')
         matches = link_pattern.findall(html)
 
-        # Альтернативный парсинг - ищем все внешние ссылки
-        if not matches:
-            alt_pattern = re.compile(r'<a href="(https?://[^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', re.DOTALL)
-            matches = alt_pattern.findall(html)
-
-        # Еще одна попытка - просто ищем заголовки
-        if not matches:
-            simple_pattern = re.compile(r'<a href="([^"]+)"[^>]*>([^<]+)</a>')
-            all_links = simple_pattern.findall(html)
-            # Фильтруем внутренние ссылки
-            matches = [(url, title) for url, title in all_links
-                      if url.startswith('http') and 'duckduckgo' not in url.lower()]
-
-        for href, title in matches[:num_results]:
+        # Фильтруем внутренние ссылки DuckDuckGo
+        for href, title in matches[:num_results * 2]:
+            if 'duckduckgo.com' in href:
+                continue
             clean_title = re.sub(r'<[^>]+>', '', title).strip()
-            clean_href = href.split('&')[0] if '&' in href else href
+            clean_href = href.split('&')[0]
 
             if clean_href and clean_title:
                 results.append({
@@ -566,6 +614,7 @@ def _search_duckduckgo_lite(query: str, num_results: int = 10) -> List[Dict[str,
                     'source': 'DuckDuckGo Lite'
                 })
 
+        results = results[:num_results]
         log(f"DuckDuckGo Lite found {len(results)} results")
     except Exception as e:
         log(f"DuckDuckGo Lite search error: {e}")
@@ -764,11 +813,11 @@ def web_search(
 
     # Определяем какие движки использовать
     if engine == "auto":
-        # DuckDuckGo API - официальный, самый надежный (не блокируется)
-        ddg_api_results = _search_duckduckgo_api(query, num_results)
-        if ddg_api_results:
-            all_results.extend(ddg_api_results)
-            engines_used.append("DuckDuckGo API")
+        # DuckDuckGo HTML - основной метод (возвращает обычные поисковые результаты)
+        html_results = _search_duckduckgo_html(query, num_results)
+        if html_results:
+            all_results.extend(html_results)
+            engines_used.append("DuckDuckGo")
 
         # DuckDuckGo Lite - второй источник
         if len(all_results) < num_results:
@@ -777,19 +826,12 @@ def web_search(
                 all_results.extend(lite_results)
                 engines_used.append("DuckDuckGo Lite")
 
-        # DuckDuckGo HTML - третий источник
+        # DuckDuckGo API - Instant Answers (статьи, википедия)
         if len(all_results) < num_results:
-            ddg_results = _search_duckduckgo(query, num_results)
-            if ddg_results:
-                all_results.extend(ddg_results)
-                engines_used.append("DuckDuckGo")
-
-        # SearxNG - мета-поисковик (если доступен)
-        if len(all_results) < num_results:
-            searx_results = _search_searxng(query, num_results)
-            if searx_results:
-                all_results.extend(searx_results)
-                engines_used.append("SearxNG")
+            api_results = _search_duckduckgo_api(query, num_results)
+            if api_results:
+                all_results.extend(api_results)
+                engines_used.append("DuckDuckGo API")
 
         # Wikipedia - запасной вариант
         if not all_results:
@@ -809,12 +851,12 @@ def web_search(
         all_results = unique_results[:num_results]
 
     elif engine == "duckduckgo":
-        # Пробуем все варианты DuckDuckGo
-        all_results = _search_duckduckgo_api(query, num_results)
+        # Пробуем HTML как основной, затем Lite
+        all_results = _search_duckduckgo_html(query, num_results)
         if not all_results:
             all_results = _search_duckduckgo_lite(query, num_results)
         if not all_results:
-            all_results = _search_duckduckgo(query, num_results)
+            all_results = _search_duckduckgo_api(query, num_results)
         engines_used.append("DuckDuckGo")
 
     elif engine == "google":
